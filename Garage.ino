@@ -22,7 +22,7 @@ void MQTTMessageReceive(char* topic, uint8_t* payload, uint16_t length)
   }
 }
 
-bool Connect()
+void Connect()
 {
   uint8_t wifiStatus = espDrv.GetConnectionStatus();
   bool wifiConnected = wifiStatus == WL_CONNECTED;
@@ -39,19 +39,17 @@ bool Connect()
       {
         mqttClient.Publish(GARAGE_STATE, doorState == HIGH? "Closed" : "Open", true);
         mqttClient.Subscribe(GARAGE_CMD);
-        return true;
       }
     }
   }
-  return false;
 }
 
 void setup() {
   pinMode(2, INPUT_PULLUP);
   pinMode(3, OUTPUT);
   digitalWrite(3, HIGH);
-  Serial.begin(9600);
-  serial.begin(9600);
+  Serial.begin(115200);
+  serial.begin(115200);
   espDrv.Init(32);
   espDrv.Connect(WifiSSID, WifiPassword);
   wdt_enable(WDTO_8S);
