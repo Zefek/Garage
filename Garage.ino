@@ -52,6 +52,7 @@ void setup() {
   serial.begin(115200);
   espDrv.Init(32);
   espDrv.Connect(WifiSSID, WifiPassword);
+  doorState = digitalRead(2);
   wdt_enable(WDTO_8S);
   Serial.println("Setup OK");
 }
