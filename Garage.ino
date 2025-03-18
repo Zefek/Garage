@@ -24,7 +24,7 @@ void MQTTMessageReceive(char* topic, uint8_t* payload, uint16_t length)
 
 void Connect()
 {
-  uint8_t wifiStatus = espDrv.GetConnectionStatus();
+  int wifiStatus = espDrv.GetConnectionStatus();
   bool wifiConnected = wifiStatus == WL_CONNECTED;
   if(wifiStatus == WL_DISCONNECTED || wifiStatus == WL_IDLE_STATUS)
   {
@@ -32,8 +32,8 @@ void Connect()
   }
   if(wifiConnected)
   {
-    uint8_t clientStatus = espDrv.GetClientStatus();
-    if(clientStatus == CL_DISCONNECTED)
+    bool isConnected = mqttClient.IsConnected();
+    if(!isConnected)
     {
       if(mqttClient.Connect(mqttConnectData))
       {
@@ -48,8 +48,8 @@ void setup() {
   pinMode(2, INPUT_PULLUP);
   pinMode(3, OUTPUT);
   digitalWrite(3, HIGH);
-  Serial.begin(115200);
-  serial.begin(115200);
+  Serial.begin(57600);
+  serial.begin(57600);
   espDrv.Init(32);
   espDrv.Connect(WifiSSID, WifiPassword);
   doorState = digitalRead(2);
