@@ -13,6 +13,9 @@ SoftwareSerial serial(4, 5);
 EspDrv espDrv(&serial);
 MQTTClient mqttClient(&espDrv, MQTTMessageReceive);
 MQTTConnectData mqttConnectData = { MQTTHost, 1883, "Garage", MQTTUsername, MQTTPassword, "", 0, false, "", false, 0x0 }; 
+unsigned long mqttConnectionTimeout = 0;
+unsigned long mqttLastConnectionTry = 0;
+unsigned long currentMillis = 0;
 
 void MQTTMessageReceive(char* topic, uint8_t* payload, uint16_t length)
 {
@@ -24,6 +27,10 @@ void MQTTMessageReceive(char* topic, uint8_t* payload, uint16_t length)
 
 void Connect()
 {
+  if(currentMillis - mqttLastConnectionTry < mqttConnectionTimeout)
+  {
+    return;
+  }
   int wifiStatus = espDrv.GetConnectionStatus();
   bool wifiConnected = wifiStatus == WL_CONNECTED;
   if(wifiStatus == WL_DISCONNECTED || wifiStatus == WL_IDLE_STATUS)
@@ -39,8 +46,19 @@ void Connect()
       {
         mqttClient.Publish(GARAGE_STATE, doorState == HIGH? "Closed" : "Open", true);
         mqttClient.Subscribe(GARAGE_CMD);
+        mqttLastConnectionTry = currentMillis;
+        mqttConnectionTimeout = 0;
+      }
+      else
+      {
+        mqttLastConnectionTry = currentMillis;
+        mqttConnectionTimeout = min(mqttConnectionTimeout + random(5000, 30000), 300000);
       }
     }
+  }
+  else
+  {
+    mqttConnectionTimeout = min(mqttConnectionTimeout + random(5000, 30000), 300000);
   }
 }
 
@@ -59,12 +77,12 @@ void setup() {
 
 void loop() {
   wdt_reset();
-  unsigned long time = millis();
+  currentMillis = millis();
   if(!mqttClient.Loop())
   {
     Connect();
   }
-  if(time - doorChangeTime > 1000)
+  if(currentMillis - doorChangeTime > 1000)
   {
     int doorValue = digitalRead(2);
     if(doorValue != doorState)
@@ -72,7 +90,7 @@ void loop() {
       doorState = doorValue;
       mqttClient.Publish(GARAGE_STATE, doorState == HIGH? "Closed" : "Open", true);
     }
-    doorChangeTime = time;
+    doorChangeTime = currentMillis;
   }
   if(doorSignal)
   {
