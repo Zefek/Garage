@@ -46,8 +46,10 @@ void Connect()
       {
         mqttClient.Publish(GARAGE_STATE, doorState == HIGH? "Closed" : "Open", true);
         mqttClient.Subscribe(GARAGE_CMD);
+
         mqttLastConnectionTry = currentMillis;
         mqttConnectionTimeout = 0;
+
       }
       else
       {
@@ -58,7 +60,8 @@ void Connect()
   }
   else
   {
-    mqttConnectionTimeout = min(mqttConnectionTimeout + random(5000, 30000), 300000);
+    mqttLastConnectionTry = currentMillis;
+    mqttConnectionTimeout = min(mqttConnectionTimeout * 2 + random(0, 5000), 300000);
   }
 }
 
