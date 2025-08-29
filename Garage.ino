@@ -28,6 +28,8 @@ void MQTTMessageReceive(char* topic, uint8_t* payload, uint16_t length)
 
 void PublishDoorState(int state, int movement)
 {
+  //state - HIGH (door closed), LOW (door open) 
+  //movement - HIGH (door stopped), LOW (door moving)
   if (state == HIGH && movement == HIGH)
   {
     mqttClient.Publish(GARAGE_STATE, "Closed;Stop", true);
@@ -44,7 +46,6 @@ void PublishDoorState(int state, int movement)
   {
     mqttClient.Publish(GARAGE_STATE, "Open;Move", true);
   }
-  mqttClient.Publish(GARAGE_STATE, doorState == HIGH? "Closed" : "Open", true);
 }
 
 void Connect()
