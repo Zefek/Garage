@@ -8,6 +8,7 @@ void MQTTMessageReceive(char* topic, uint8_t* payload, uint16_t length);
 
 unsigned long doorChangeTime = 0;
 int doorState = LOW;
+int moveState = HIGH;
 bool doorSignal = false;
 SoftwareSerial serial(4, 5);
 EspDrv espDrv(&serial);
@@ -23,6 +24,27 @@ void MQTTMessageReceive(char* topic, uint8_t* payload, uint16_t length)
   {
     doorSignal = true;
   }
+}
+
+void PublishDoorState(int state, int movement)
+{
+  if (state == HIGH && movement == HIGH)
+  {
+    mqttClient.Publish(GARAGE_STATE, "Closed;Stop", true);
+  }
+  if (state == LOW && movement == HIGH)
+  {
+    mqttClient.Publish(GARAGE_STATE, "Open;Stop", true);
+  }
+  if (state == HIGH && movement == LOW)
+  {
+    mqttClient.Publish(GARAGE_STATE, "Closed;Move", true);
+  }
+  if (state == LOW && movement == LOW)
+  {
+    mqttClient.Publish(GARAGE_STATE, "Open;Move", true);
+  }
+  mqttClient.Publish(GARAGE_STATE, doorState == HIGH? "Closed" : "Open", true);
 }
 
 void Connect()
@@ -44,7 +66,7 @@ void Connect()
     {
       if(mqttClient.Connect(mqttConnectData))
       {
-        mqttClient.Publish(GARAGE_STATE, doorState == HIGH? "Closed" : "Open", true);
+        PublishDoorState(doorState, moveState);
         mqttClient.Subscribe(GARAGE_CMD);
 
         mqttLastConnectionTry = currentMillis;
@@ -68,12 +90,14 @@ void Connect()
 void setup() {
   pinMode(2, INPUT_PULLUP);
   pinMode(3, OUTPUT);
+  pinMode(4, INPUT_PULLUP);
   digitalWrite(3, HIGH);
   Serial.begin(57600);
   serial.begin(57600);
   espDrv.Init(32);
   espDrv.Connect(WifiSSID, WifiPassword);
   doorState = digitalRead(2);
+  moveState = digitalRead(4);
   wdt_enable(WDTO_8S);
   Serial.println("Setup OK");
 }
@@ -88,10 +112,12 @@ void loop() {
   if(currentMillis - doorChangeTime > 1000)
   {
     int doorValue = digitalRead(2);
-    if(doorValue != doorState)
+    int moveValue = digitalRead(4);
+    if(doorValue != doorState || moveValue != moveState)
     {
       doorState = doorValue;
-      mqttClient.Publish(GARAGE_STATE, doorState == HIGH? "Closed" : "Open", true);
+      moveState = moveValue;
+      PublishDoorState(doorState, moveState);
     }
     doorChangeTime = currentMillis;
   }
