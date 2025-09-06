@@ -3,6 +3,14 @@
 #include <SoftwareSerial.h>
 #include "config.h"
 #include <avr/wdt.h>
+#include <AM2302-Sensor.h>
+
+#define DOORSWITCH_PIN 2
+#define DOORBUTTON_PIN 3
+#define RX_PIN 4
+#define TX_PIN 5
+#define DOORFLASH_PIN 6
+#define TEMPERATURE_SENSOR_PIN 7
 
 void MQTTMessageReceive(char* topic, uint8_t* payload, uint16_t length);
 
@@ -10,13 +18,16 @@ unsigned long doorChangeTime = 0;
 int doorState = LOW;
 int moveState = HIGH;
 bool doorSignal = false;
-SoftwareSerial serial(4, 5);
+SoftwareSerial serial(RX_PIN, TX_PIN);
 EspDrv espDrv(&serial);
 MQTTClient mqttClient(&espDrv, MQTTMessageReceive);
 MQTTConnectData mqttConnectData = { MQTTHost, 1883, "Garage", MQTTUsername, MQTTPassword, "", 0, false, "", false, 0x0 }; 
 unsigned long mqttConnectionTimeout = 0;
 unsigned long mqttLastConnectionTry = 0;
 unsigned long currentMillis = 0;
+unsigned long temperatureHumidityReadMillis = 0;
+AM2302::AM2302_Sensor am2302{ TEMPERATURE_SENSOR_PIN };
+char temperatureData[10];
 
 void MQTTMessageReceive(char* topic, uint8_t* payload, uint16_t length)
 {
@@ -89,16 +100,21 @@ void Connect()
 }
 
 void setup() {
-  pinMode(2, INPUT_PULLUP);
-  pinMode(3, OUTPUT);
-  pinMode(4, INPUT_PULLUP);
-  digitalWrite(3, HIGH);
+  pinMode(DOORSWITCH_PIN, INPUT_PULLUP);
+  pinMode(DOORBUTTON_PIN, OUTPUT);
+  pinMode(DOORFLASH_PIN, INPUT_PULLUP);
+  pinMode(TEMPERATURE_SENSOR_PIN, INPUT);
+  digitalWrite(DOORBUTTON_PIN, HIGH);
   Serial.begin(57600);
   serial.begin(57600);
   espDrv.Init(32);
   espDrv.Connect(WifiSSID, WifiPassword);
-  doorState = digitalRead(2);
-  moveState = digitalRead(4);
+  doorState = digitalRead(DOORSWITCH_PIN);
+  moveState = digitalRead(6);
+  if (am2302.begin()) 
+  {
+    delay(3000);
+  }
   wdt_enable(WDTO_8S);
   Serial.println("Setup OK");
 }
@@ -112,8 +128,8 @@ void loop() {
   }
   if(currentMillis - doorChangeTime > 1000)
   {
-    int doorValue = digitalRead(2);
-    int moveValue = digitalRead(4);
+    int doorValue = digitalRead(DOORSWITCH_PIN);
+    int moveValue = digitalRead(DOORFLASH_PIN);
     if(doorValue != doorState || moveValue != moveState)
     {
       doorState = doorValue;
@@ -124,9 +140,17 @@ void loop() {
   }
   if(doorSignal)
   {
-    digitalWrite(3, LOW);
+    digitalWrite(DOORBUTTON_PIN, LOW);
     delay(500);
-    digitalWrite(3, HIGH);
+    digitalWrite(DOORBUTTON_PIN, HIGH);
     doorSignal = false;
+  }
+  if(currentMillis - temperatureHumidityReadMillis > 60000)
+  {
+    int temperature = (int)(am2302.get_Temperature() * 10);
+    int humidity = (int)am2302.get_Humidity();
+    sprintf(temperatureData, "%d;%d", temperature, humidity);
+    mqttClient.Publish(GARAGE_TEMPERATURE, temperatureData);
+    temperatureHumidityReadMillis = currentMillis;
   }
 }
