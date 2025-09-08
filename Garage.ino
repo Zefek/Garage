@@ -28,6 +28,12 @@ unsigned long currentMillis = 0;
 unsigned long temperatureHumidityReadMillis = 0;
 AM2302::AM2302_Sensor am2302{ TEMPERATURE_SENSOR_PIN };
 char temperatureData[10];
+bool doorMoveDetected = false;
+
+void DoorFlashChange()
+{
+  doorMoveDetected = true;
+}
 
 void MQTTMessageReceive(char* topic, uint8_t* payload, uint16_t length)
 {
@@ -110,11 +116,11 @@ void setup() {
   espDrv.Init(32);
   espDrv.Connect(WifiSSID, WifiPassword);
   doorState = digitalRead(DOORSWITCH_PIN);
-  moveState = digitalRead(6);
   if (am2302.begin()) 
   {
     delay(3000);
   }
+  attachInterrupt(DOORFLASH_PIN, DoorFlashChange, HIGH);
   wdt_enable(WDTO_8S);
   Serial.println("Setup OK");
 }
@@ -129,14 +135,14 @@ void loop() {
   if(currentMillis - doorChangeTime > 1000)
   {
     int doorValue = digitalRead(DOORSWITCH_PIN);
-    int moveValue = digitalRead(DOORFLASH_PIN);
-    if(doorValue != doorState || moveValue != moveState)
+    if(doorValue != doorState || (doorMoveDetected && moveState == HIGH) || (!doorMoveDetected && moveState == LOW))
     {
       doorState = doorValue;
-      moveState = moveValue;
+      moveState = doorMoveDetected? LOW : HIGH;
       PublishDoorState(doorState, moveState);
     }
     doorChangeTime = currentMillis;
+    doorMoveDetected = false;
   }
   if(doorSignal)
   {
