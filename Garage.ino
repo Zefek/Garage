@@ -30,11 +30,6 @@ AM2302::AM2302_Sensor am2302{ TEMPERATURE_SENSOR_PIN };
 char temperatureData[10];
 bool doorMoveDetected = false;
 
-void DoorFlashChange()
-{
-  doorMoveDetected = true;
-}
-
 void MQTTMessageReceive(char* topic, uint8_t* payload, uint16_t length)
 {
   if(strcmp(topic, GARAGE_CMD) == 0)
@@ -120,7 +115,6 @@ void setup() {
   {
     delay(3000);
   }
-  attachInterrupt(DOORFLASH_PIN, DoorFlashChange, HIGH);
   wdt_enable(WDTO_8S);
   Serial.println("Setup OK");
 }
@@ -131,6 +125,10 @@ void loop() {
   if(!mqttClient.Loop())
   {
     Connect();
+  }
+  if(digitalRead(DOORFLASH_PIN) == LOW)
+  {
+    doorMoveDetected = true;
   }
   if(currentMillis - doorChangeTime > 1000)
   {
@@ -153,6 +151,7 @@ void loop() {
   }
   if(currentMillis - temperatureHumidityReadMillis > 60000)
   {
+    uint8_t status = am2302.read();
     int temperature = (int)(am2302.get_Temperature() * 10);
     int humidity = (int)am2302.get_Humidity();
     sprintf(temperatureData, "%d;%d", temperature, humidity);
