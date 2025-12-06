@@ -34,7 +34,6 @@ jobs:
       - name: Install custom library
         run: |
           mkdir -p ~/Arduino/libraries
-          git clone https://github.com/Zefek/TX07K-TXC.git ~/Arduino/libraries/TX07K-TXC
           git clone https://github.com/Zefek/MQTTESP8266.git ~/Arduino/libraries/MQTTESP8266
 
       - name: Set configs
