@@ -1,4 +1,4 @@
-name: Deploy LS Sensor on Environment
+name: Deploy Garage on Environment
 
 on:
   deployment:
