@@ -3,6 +3,10 @@ name: Deploy Garage on Environment
 on:
   deployment:
 
+permissions:
+  contents: read
+  deployments: write
+
 jobs:
   deployment:
     runs-on: [self-hosted, iot]
@@ -11,20 +15,20 @@ jobs:
     steps:
 
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
       - name: Initialize Arduino CLI
         run: |
           & "$Env:RUNNER_TOOL_CACHE\arduino-cli\arduino-cli.exe" --config-file config.yaml core update-index
 
       - name: Install required board core
-        run: | 
-          & "$Env:RUNNER_TOOL_CACHE\arduino-cli\arduino-cli.exe" --config-file config.yaml core install arduino:avr 
-          
+        run: |
+          & "$Env:RUNNER_TOOL_CACHE\arduino-cli\arduino-cli.exe" --config-file config.yaml core install arduino:avr@1.8.7
+
       - name: Install custom Arduino libraries (Windows)
         shell: powershell
         run: |
-          & "$Env:RUNNER_TOOL_CACHE\arduino-cli\arduino-cli.exe" --config-file config.yaml lib install MQTTESP8266
+          & "$Env:RUNNER_TOOL_CACHE\arduino-cli\arduino-cli.exe" --config-file config.yaml lib install "MQTTESP8266@5.1.1"
 
       - name: Set configs (Windows)
         shell: powershell
@@ -38,6 +42,11 @@ jobs:
           & "$Env:RUNNER_TOOL_CACHE\arduino-cli\arduino-cli.exe" --config-file config.yaml compile --fqbn arduino:avr:uno ./ --output-dir build
 
       - name: Upload firmware to Arduino
+        env:
+          SERIAL_PORT: ${{ github.event.deployment.payload.serial_port }}
         run: |
-          $port = "${{ github.event.deployment.payload.serial_port }}"
-          & "$Env:RUNNER_TOOL_CACHE\arduino-cli\arduino-cli.exe" --config-file config.yaml upload --fqbn arduino:avr:uno --port $port --input-dir build
+          if ($env:SERIAL_PORT -notmatch '^COM\d+$') {
+            Write-Error "Invalid serial port format: $env:SERIAL_PORT"
+            exit 1
+          }
+          & "$Env:RUNNER_TOOL_CACHE\arduino-cli\arduino-cli.exe" --config-file config.yaml upload --fqbn arduino:avr:uno --port $env:SERIAL_PORT --input-dir build

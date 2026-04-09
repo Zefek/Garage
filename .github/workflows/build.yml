@@ -6,18 +6,19 @@ on:
       - main
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
       - name: Install Arduino CLI
-        run: |
-          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
-          sudo mv bin/arduino-cli /usr/local/bin/
+        uses: arduino/setup-arduino-cli@81d310742121c928ea9c8bbd407b4217b432ae02  # v2.0.0
 
       - name: Initialize Arduino CLI
         run: |
@@ -25,16 +26,16 @@ jobs:
           arduino-cli core update-index
 
       - name: Install required board core
-        run: arduino-cli core install arduino:avr
-      
+        run: arduino-cli core install arduino:avr@1.8.7
+
       - name: Install libraries
         run: |
-          arduino-cli lib install "AM2302-Sensor"
-          
+          arduino-cli lib install "AM2302-Sensor@1.4.0"
+
       - name: Install custom library
         run: |
           mkdir -p ~/Arduino/libraries
-          git clone https://github.com/Zefek/MQTTESP8266.git ~/Arduino/libraries/MQTTESP8266
+          git clone --branch 5.1.1 --depth 1 https://github.com/Zefek/MQTTESP8266.git ~/Arduino/libraries/MQTTESP8266
 
       - name: Set configs
         run: |
