@@ -31,11 +31,7 @@ jobs:
       - name: Install libraries
         run: |
           arduino-cli lib install "AM2302-Sensor@1.4.0"
-
-      - name: Install custom library
-        run: |
-          mkdir -p ~/Arduino/libraries
-          git clone --branch 5.1.1 --depth 1 https://github.com/Zefek/MQTTESP8266.git ~/Arduino/libraries/MQTTESP8266
+          arduino-cli lib install "MQTTESP8266@5.1.2"
 
       - name: Set configs
         run: |
