@@ -28,7 +28,7 @@ jobs:
       - name: Install custom Arduino libraries (Windows)
         shell: powershell
         run: |
-          & "$Env:RUNNER_TOOL_CACHE\arduino-cli\arduino-cli.exe" --config-file config.yaml lib install "MQTTESP8266@5.1.1"
+          & "$Env:RUNNER_TOOL_CACHE\arduino-cli\arduino-cli.exe" --config-file config.yaml lib install "MQTTESP8266@5.1.2"
 
       - name: Set configs (Windows)
         shell: powershell
