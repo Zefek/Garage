@@ -29,6 +29,7 @@ jobs:
         shell: powershell
         run: |
           & "$Env:RUNNER_TOOL_CACHE\arduino-cli\arduino-cli.exe" --config-file config.yaml lib install "MQTTESP8266@5.1.2"
+          & "$Env:RUNNER_TOOL_CACHE\arduino-cli\arduino-cli.exe" --config-file config.yaml lib install "AM2302-Sensor@1.4.0"
 
       - name: Generate configs from secrets repo
         shell: powershell
