@@ -2,6 +2,7 @@
 #include <MQTTClient.h>
 #include <SoftwareSerial.h>
 #include "config.h"
+#include "secret.h"
 #include <avr/wdt.h>
 #include <AM2302-Sensor.h>
 
