@@ -14,6 +14,8 @@
 #define TEMPERATURE_SENSOR_PIN 7
 
 void MQTTMessageReceive(char* topic, uint8_t* payload, uint16_t length);
+void OnBusy(uint8_t count);
+void DataTimeout();
 
 unsigned long doorChangeTime = 0;
 int doorState = LOW;
@@ -30,12 +32,26 @@ unsigned long temperatureHumidityReadMillis = 0;
 AM2302::AM2302_Sensor am2302{ TEMPERATURE_SENSOR_PIN };
 char temperatureData[10];
 bool doorMoveDetected = false;
+bool closeRequired = false;
 
 void MQTTMessageReceive(char* topic, uint8_t* payload, uint16_t length)
 {
   if(strcmp(topic, GARAGE_CMD) == 0)
   {
     doorSignal = true;
+  }
+}
+
+void DataTimeout()
+{
+  closeRequired = true;
+}
+
+void OnBusy(uint8_t count)
+{
+  if(count > 10)
+  {
+    closeRequired = true;
   }
 }
 
@@ -110,6 +126,8 @@ void setup() {
   Serial.begin(57600);
   serial.begin(57600);
   espDrv.Init(32);
+  espDrv.OnBusy = OnBusy;
+  espDrv.DataTimeout = DataTimeout;
   espDrv.Connect(WifiSSID, WifiPassword);
   doorState = digitalRead(DOORSWITCH_PIN);
   if (am2302.begin()) 
@@ -123,6 +141,11 @@ void setup() {
 void loop() {
   wdt_reset();
   currentMillis = millis();
+  if(closeRequired)
+  {
+    espDrv.Close();
+    closeRequired = false;
+  }
   if(!mqttClient.Loop())
   {
     Connect();

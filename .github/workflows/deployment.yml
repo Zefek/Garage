@@ -20,6 +20,7 @@ jobs:
       - name: Initialize Arduino CLI
         run: |
           & "$Env:RUNNER_TOOL_CACHE\arduino-cli\arduino-cli.exe" --config-file config.yaml core update-index
+          & "$Env:RUNNER_TOOL_CACHE\arduino-cli\arduino-cli.exe" --config-file "$Env:RUNNER_TOOL_CACHE\arduino-cli\config.yaml" config set library.enable_unsafe_install true
 
       - name: Install required board core
         run: |
@@ -28,7 +29,7 @@ jobs:
       - name: Install custom Arduino libraries (Windows)
         shell: powershell
         run: |
-          & "$Env:RUNNER_TOOL_CACHE\arduino-cli\arduino-cli.exe" --config-file config.yaml lib install "MQTTESP8266@5.1.2"
+          & "$Env:RUNNER_TOOL_CACHE\arduino-cli\arduino-cli.exe" --config-file config.yaml lib install --git-url https://github.com/Zefek/MQTTESP8266.git#6.0
           & "$Env:RUNNER_TOOL_CACHE\arduino-cli\arduino-cli.exe" --config-file config.yaml lib install "AM2302-Sensor@1.4.0"
 
       - name: Generate configs from secrets repo
