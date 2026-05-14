@@ -27,6 +27,7 @@ struct DiagData {
   uint8_t  resetReason;
   uint16_t loopMaxMs;
   uint16_t doorCycles;
+  int8_t   rssi;
 };
 #pragma pack(pop)
 
@@ -46,7 +47,7 @@ AM2302::AM2302_Sensor am2302{ TEMPERATURE_SENSOR_PIN };
 char temperatureData[10];
 bool doorMoveDetected = false;
 bool closeRequired = false;
-DiagData currentDiagData = { 0, 0, 0, 0, 0, 0, 0, 0 };
+DiagData currentDiagData = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 unsigned long lastDiagSendMillis = 0;
 
 extern int __heap_start, *__brkval;
@@ -150,6 +151,7 @@ void sendDiag()
 {
   currentDiagData.uptime = currentMillis / 60000;
   currentDiagData.freeRam = freeRam();
+  currentDiagData.rssi = espDrv.GetRssi();
   uint8_t buffer[sizeof(DiagData)];
   memcpy(buffer, &currentDiagData, sizeof(DiagData));
   mqttClient.Publish(GARAGE_DIAG, buffer, sizeof(DiagData), false);
