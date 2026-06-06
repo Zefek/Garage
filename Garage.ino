@@ -5,6 +5,10 @@
 #include "secret.h"
 #include <avr/wdt.h>
 #include <AM2302-Sensor.h>
+#include <EEPROM.h>
+
+#define SENSOR_ID_ADDR 0
+#define SENSOR_CHANNEL 4
 
 #define DOORSWITCH_PIN 2
 #define DOORBUTTON_PIN 3
@@ -44,7 +48,8 @@ unsigned long mqttLastConnectionTry = 0;
 unsigned long currentMillis = 0;
 unsigned long temperatureHumidityReadMillis = 0;
 AM2302::AM2302_Sensor am2302{ TEMPERATURE_SENSOR_PIN };
-char temperatureData[10];
+char temperatureData[20];
+uint16_t sensorId = 0;
 bool doorMoveDetected = false;
 bool closeRequired = false;
 DiagData currentDiagData = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
@@ -178,6 +183,13 @@ void setup() {
   {
     delay(3000);
   }
+  EEPROM.get(SENSOR_ID_ADDR, sensorId);
+  if (sensorId == 0xFFFF || sensorId == 0)
+  {
+    randomSeed(analogRead(A0));
+    sensorId = random(256, 65535);
+    EEPROM.put(SENSOR_ID_ADDR, sensorId);
+  }
   wdt_enable(WDTO_8S);
   Serial.println("Setup OK");
 }
@@ -230,7 +242,7 @@ void loop() {
     }
     int temperature = (int)(am2302.get_Temperature() * 10);
     int humidity = (int)am2302.get_Humidity();
-    sprintf(temperatureData, "%d;%d", temperature, humidity);
+    sprintf(temperatureData, "%u;%d;%d;%d", sensorId, temperature, humidity, SENSOR_CHANNEL);
     mqttClient.Publish(GARAGE_TEMPERATURE, temperatureData);
     temperatureHumidityReadMillis = currentMillis;
   }
