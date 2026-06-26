@@ -7,6 +7,9 @@
 #include <AM2302-Sensor.h>
 #include <EEPROM.h>
 
+#ifndef FW_VERSION
+#define FW_VERSION 0
+#endif
 #define SENSOR_ID_ADDR 0
 #define SENSOR_CHANNEL 4
 
