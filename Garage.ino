@@ -334,7 +334,7 @@ void setup() {
   digitalWrite(DOORBUTTON_PIN, HIGH);
   Serial.begin(57600);
   serial.begin(57600);
-  espDrv.Init(32);
+  espDrv.Init(64);
   espDrv.OnBusy = OnBusy;
   espDrv.DataTimeout = DataTimeout;
   espDrv.Connect(WifiSSID, WifiPassword);
