@@ -107,10 +107,10 @@ static bool isHexChar(char c) {
 
 static bool parseSigningKey() {
   const char* h = SigningKeyHex;
+  if (strnlen(h, GARAGE_KEY_LEN * 2 + 2) != (size_t)(GARAGE_KEY_LEN * 2)) return false;
   for (uint8_t i = 0; i < GARAGE_KEY_LEN * 2; i++) {
     if (!isHexChar(h[i])) return false;
   }
-  if (h[GARAGE_KEY_LEN * 2] != '\0') return false;
   for (uint8_t i = 0; i < GARAGE_KEY_LEN; i++) {
     signingKey[i] = (hexNibble(h[i * 2]) << 4) | hexNibble(h[i * 2 + 1]);
   }
