@@ -81,6 +81,7 @@ bool challengePending = false;
 bool responsePending = false;
 uint8_t reqBuf[4];
 uint8_t respBuf[4 + GARAGE_NONCE_LEN + GARAGE_SIG_LEN];
+uint8_t entropyPool[32];
 
 static uint32_t readLE32(const uint8_t* p) {
   return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
@@ -100,16 +101,47 @@ static uint8_t hexNibble(char c) {
   return 0;
 }
 
-static void parseSigningKey() {
+static bool isHexChar(char c) {
+  return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+static bool parseSigningKey() {
   const char* h = SigningKeyHex;
+  for (uint8_t i = 0; i < GARAGE_KEY_LEN * 2; i++) {
+    if (!isHexChar(h[i])) return false;
+  }
+  if (h[GARAGE_KEY_LEN * 2] != '\0') return false;
   for (uint8_t i = 0; i < GARAGE_KEY_LEN; i++) {
     signingKey[i] = (hexNibble(h[i * 2]) << 4) | hexNibble(h[i * 2 + 1]);
   }
+  return true;
+}
+
+static void seedEntropy() {
+  for (uint8_t i = 0; i < 32; i++) {
+    entropyPool[i] = (uint8_t)analogRead(A0) ^ (uint8_t)(micros() >> (i & 7));
+    delayMicroseconds(29);
+  }
+}
+
+static void stirEntropy() {
+  static uint8_t idx = 0;
+  entropyPool[idx & 31] ^= (uint8_t)analogRead(A0);
+  entropyPool[(idx + 13) & 31] += (uint8_t)micros();
+  idx++;
 }
 
 static void generateNonce(uint8_t* out) {
-  for (uint8_t i = 0; i < GARAGE_NONCE_LEN; i++) {
-    out[i] = (uint8_t)(random(256) ^ (analogRead(A0) & 0xFF) ^ (micros() >> (i & 7)));
+  entropyPool[0] ^= (uint8_t)micros();
+  entropyPool[1] ^= (uint8_t)analogRead(A0);
+  uint8_t hash[32];
+  Sha256Ctx ctx;
+  sha256_init(&ctx);
+  sha256_update(&ctx, entropyPool, sizeof(entropyPool));
+  sha256_final(&ctx, hash);
+  memcpy(out, hash, GARAGE_NONCE_LEN);
+  for (uint8_t i = 0; i < 32; i++) {
+    entropyPool[i] ^= hash[i];
   }
 }
 
@@ -319,7 +351,10 @@ void setup() {
     EEPROM.put(SENSOR_ID_ADDR, sensorId);
   }
   randomSeed(analogRead(A0) ^ micros());
-  parseSigningKey();
+  seedEntropy();
+  if (!parseSigningKey()) {
+    Serial.println(F("SigningKey INVALID"));
+  }
   Serial.println(cryptoSelfTest() ? F("HMAC selftest OK") : F("HMAC selftest FAIL"));
   wdt_enable(WDTO_8S);
   Serial.println("Setup OK");
@@ -328,6 +363,7 @@ void setup() {
 void loop() {
   wdt_reset();
   currentMillis = millis();
+  stirEntropy();
   if(closeRequired)
   {
     espDrv.Close();
