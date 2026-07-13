@@ -333,7 +333,7 @@ void setup() {
   pinMode(TEMPERATURE_SENSOR_PIN, INPUT);
   digitalWrite(DOORBUTTON_PIN, HIGH);
   Serial.begin(57600);
-  serial.begin(57600);
+  serial.begin(19200);
   espDrv.Init(64);
   espDrv.OnBusy = OnBusy;
   espDrv.DataTimeout = DataTimeout;
