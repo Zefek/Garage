@@ -80,7 +80,7 @@ OpenSlot openSlot = { { 0 }, 0, 0, false };
 bool challengePending = false;
 bool responsePending = false;
 uint8_t reqBuf[4];
-uint8_t respBuf[4 + GARAGE_NONCE_LEN + GARAGE_SIG_LEN];
+uint8_t respBuf[4 + GARAGE_SIG_LEN];
 uint8_t entropyPool[32];
 
 static uint32_t readLE32(const uint8_t* p) {
@@ -185,8 +185,7 @@ static void processHandshake() {
     uint8_t status = GARAGE_STATUS_EXPIRED;
     if (openSlot.valid
         && (currentMillis - openSlot.issuedAt) <= GARAGE_OPEN_TTL
-        && r == openSlot.correlationId
-        && memcmp(respBuf + 4, openSlot.nonce, GARAGE_NONCE_LEN) == 0) {
+        && r == openSlot.correlationId) {
       uint8_t msg[4 + GARAGE_NONCE_LEN + 4];
       writeLE32(msg, r);
       memcpy(msg + 4, openSlot.nonce, GARAGE_NONCE_LEN);
@@ -195,7 +194,7 @@ static void processHandshake() {
       hmac_sha256(signingKey, GARAGE_KEY_LEN, msg, sizeof(msg), mac);
       uint8_t diff = 0;
       for (uint8_t i = 0; i < GARAGE_SIG_LEN; i++) {
-        diff |= mac[i] ^ respBuf[4 + GARAGE_NONCE_LEN + i];
+        diff |= mac[i] ^ respBuf[4 + i];
       }
       if (diff == 0) {
         doorSignal = true;
@@ -229,6 +228,8 @@ void MQTTMessageReceive(char* topic, uint8_t* payload, uint16_t length)
 
 void DataTimeout()
 {
+  Serial.print("Overflow :");
+  Serial.println(serial.overflow());
   closeRequired = true;
 }
 
