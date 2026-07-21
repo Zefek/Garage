@@ -3,6 +3,7 @@
 #include <SoftwareSerial.h>
 #include "config.h"
 #include "secret.h"
+#include "sha256.h"
 #include <avr/wdt.h>
 #include <AM2302-Sensor.h>
 #include <EEPROM.h>
@@ -64,16 +65,171 @@ int freeRam() {
   return (int)&v - (__brkval == 0 ? (int)&__heap_start : (int)__brkval);
 }
 
+#define GARAGE_STATUS_OPENED 1
+#define GARAGE_STATUS_EXPIRED 2
+#define GARAGE_STATUS_BADSIG 3
+
+uint8_t signingKey[GARAGE_KEY_LEN];
+struct OpenSlot {
+  uint8_t nonce[GARAGE_NONCE_LEN];
+  uint32_t issuedAt;
+  uint32_t correlationId;
+  bool valid;
+};
+OpenSlot openSlot = { { 0 }, 0, 0, false };
+bool challengePending = false;
+bool responsePending = false;
+uint8_t reqBuf[4];
+uint8_t respBuf[4 + GARAGE_SIG_LEN];
+uint8_t entropyPool[32];
+
+static uint32_t readLE32(const uint8_t* p) {
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static void writeLE32(uint8_t* p, uint32_t v) {
+  p[0] = (uint8_t)v;
+  p[1] = (uint8_t)(v >> 8);
+  p[2] = (uint8_t)(v >> 16);
+  p[3] = (uint8_t)(v >> 24);
+}
+
+static uint8_t hexNibble(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return 0;
+}
+
+static bool isHexChar(char c) {
+  return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+static bool parseSigningKey() {
+  const char* h = SigningKeyHex;
+  if (strnlen(h, GARAGE_KEY_LEN * 2 + 2) != (size_t)(GARAGE_KEY_LEN * 2)) return false;
+  for (uint8_t i = 0; i < GARAGE_KEY_LEN * 2; i++) {
+    if (!isHexChar(h[i])) return false;
+  }
+  for (uint8_t i = 0; i < GARAGE_KEY_LEN; i++) {
+    signingKey[i] = (hexNibble(h[i * 2]) << 4) | hexNibble(h[i * 2 + 1]);
+  }
+  return true;
+}
+
+static void seedEntropy() {
+  for (uint8_t i = 0; i < 32; i++) {
+    entropyPool[i] = (uint8_t)analogRead(A0) ^ (uint8_t)(micros() >> (i & 7));
+    delayMicroseconds(29);
+  }
+}
+
+static void stirEntropy() {
+  static uint8_t idx = 0;
+  entropyPool[idx & 31] ^= (uint8_t)analogRead(A0);
+  entropyPool[(idx + 13) & 31] += (uint8_t)micros();
+  idx++;
+}
+
+static void generateNonce(uint8_t* out) {
+  entropyPool[0] ^= (uint8_t)micros();
+  entropyPool[1] ^= (uint8_t)analogRead(A0);
+  uint8_t hash[32];
+  Sha256Ctx ctx;
+  sha256_init(&ctx);
+  sha256_update(&ctx, entropyPool, sizeof(entropyPool));
+  sha256_final(&ctx, hash);
+  memcpy(out, hash, GARAGE_NONCE_LEN);
+  for (uint8_t i = 0; i < 32; i++) {
+    entropyPool[i] ^= hash[i];
+  }
+}
+
+static bool cryptoSelfTest() {
+  uint8_t mac[32];
+  hmac_sha256((const uint8_t*)"Jefe", 4, (const uint8_t*)"what do ya want for nothing?", 28, mac);
+  const uint8_t expected[8] = { 0x5b, 0xdc, 0xc1, 0x46, 0xbf, 0x60, 0x75, 0x4e };
+  for (uint8_t i = 0; i < 8; i++) {
+    if (mac[i] != expected[i]) return false;
+  }
+  return true;
+}
+
+static void publishChallenge(uint32_t r) {
+  uint8_t buf[4 + GARAGE_NONCE_LEN];
+  writeLE32(buf, r);
+  memcpy(buf + 4, openSlot.nonce, GARAGE_NONCE_LEN);
+  mqttClient.Publish(GARAGE_OPEN_CHALLENGE, buf, sizeof(buf), false);
+}
+
+static void publishResult(uint32_t r, uint8_t status) {
+  uint8_t buf[5];
+  writeLE32(buf, r);
+  buf[4] = status;
+  mqttClient.Publish(GARAGE_OPEN_RESULT, buf, sizeof(buf), false);
+}
+
+static void processHandshake() {
+  if (challengePending) {
+    challengePending = false;
+    uint32_t r = readLE32(reqBuf);
+    generateNonce(openSlot.nonce);
+    openSlot.issuedAt = currentMillis;
+    openSlot.correlationId = r;
+    openSlot.valid = true;
+    publishChallenge(r);
+  }
+  if (responsePending) {
+    responsePending = false;
+    uint32_t r = readLE32(respBuf);
+    uint8_t status = GARAGE_STATUS_EXPIRED;
+    if (openSlot.valid
+        && (currentMillis - openSlot.issuedAt) <= GARAGE_OPEN_TTL
+        && r == openSlot.correlationId) {
+      uint8_t msg[4 + GARAGE_NONCE_LEN + 4];
+      writeLE32(msg, r);
+      memcpy(msg + 4, openSlot.nonce, GARAGE_NONCE_LEN);
+      memcpy(msg + 4 + GARAGE_NONCE_LEN, "open", 4);
+      uint8_t mac[32];
+      hmac_sha256(signingKey, GARAGE_KEY_LEN, msg, sizeof(msg), mac);
+      uint8_t diff = 0;
+      for (uint8_t i = 0; i < GARAGE_SIG_LEN; i++) {
+        diff |= mac[i] ^ respBuf[4 + i];
+      }
+      if (diff == 0) {
+        doorSignal = true;
+        openSlot.valid = false;
+        status = GARAGE_STATUS_OPENED;
+      } else {
+        status = GARAGE_STATUS_BADSIG;
+      }
+    }
+    publishResult(r, status);
+  }
+}
+
 void MQTTMessageReceive(char* topic, uint8_t* payload, uint16_t length)
 {
   if(strcmp(topic, GARAGE_CMD) == 0)
   {
     doorSignal = true;
   }
+  else if(strcmp(topic, GARAGE_OPEN_REQUEST) == 0 && length >= 4)
+  {
+    memcpy(reqBuf, payload, 4);
+    challengePending = true;
+  }
+  else if(strcmp(topic, GARAGE_OPEN_RESPONSE) == 0 && length == sizeof(respBuf))
+  {
+    memcpy(respBuf, payload, sizeof(respBuf));
+    responsePending = true;
+  }
 }
 
 void DataTimeout()
 {
+  Serial.print("Overflow :");
+  Serial.println(serial.overflow());
   closeRequired = true;
 }
 
@@ -136,6 +292,8 @@ void Connect()
       {
         PublishDoorState(doorState, moveState);
         mqttClient.Subscribe(GARAGE_CMD);
+        mqttClient.Subscribe(GARAGE_OPEN_REQUEST, 1);
+        mqttClient.Subscribe(GARAGE_OPEN_RESPONSE, 1);
 
         mqttLastConnectionTry = currentMillis;
         mqttConnectionTimeout = 0;
@@ -176,8 +334,8 @@ void setup() {
   pinMode(TEMPERATURE_SENSOR_PIN, INPUT);
   digitalWrite(DOORBUTTON_PIN, HIGH);
   Serial.begin(57600);
-  serial.begin(57600);
-  espDrv.Init(32);
+  serial.begin(19200);
+  espDrv.Init(64);
   espDrv.OnBusy = OnBusy;
   espDrv.DataTimeout = DataTimeout;
   espDrv.Connect(WifiSSID, WifiPassword);
@@ -193,6 +351,12 @@ void setup() {
     sensorId = random(256, 65535);
     EEPROM.put(SENSOR_ID_ADDR, sensorId);
   }
+  randomSeed(analogRead(A0) ^ micros());
+  seedEntropy();
+  if (!parseSigningKey()) {
+    Serial.println(F("SigningKey INVALID"));
+  }
+  Serial.println(cryptoSelfTest() ? F("HMAC selftest OK") : F("HMAC selftest FAIL"));
   wdt_enable(WDTO_8S);
   Serial.println("Setup OK");
 }
@@ -200,6 +364,7 @@ void setup() {
 void loop() {
   wdt_reset();
   currentMillis = millis();
+  stirEntropy();
   if(closeRequired)
   {
     espDrv.Close();
@@ -229,6 +394,7 @@ void loop() {
     doorChangeTime = currentMillis;
     doorMoveDetected = false;
   }
+  processHandshake();
   if(doorSignal)
   {
     digitalWrite(DOORBUTTON_PIN, LOW);
