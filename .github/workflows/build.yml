@@ -31,7 +31,10 @@ jobs:
         run: |
           cp ./src/Arduino/config_default.h ./src/Arduino/config.h
           cp ./src/Arduino/secret_default.h ./src/Arduino/secret.h
+          cp ./src/ESP32/config_default.h ./src/ESP32/config.h
+          cp ./src/ESP32/secret_default.h ./src/ESP32/secret.h
 
-      - name: Compile Arduino project
+      - name: Compile
         run: |
           arduino-cli compile ./src/Arduino
+          arduino-cli compile ./src/ESP32
