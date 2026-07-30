@@ -29,9 +29,9 @@ jobs:
       
       - name: Set configs
         run: |
-          cp config_default.h config.h
-          cp secret_default.h secret.h
+          cp ./src/Arduino/config_default.h ./src/Arduino/config.h
+          cp ./src/Arduino/secret_default.h ./src/Arduino/secret.h
 
       - name: Compile Arduino project
         run: |
-          arduino-cli compile --profile Garage_UNO ./
+          arduino-cli compile ./src/Arduino
