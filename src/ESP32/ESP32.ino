@@ -30,7 +30,15 @@
 #define TIME_SYNC_TIMEOUT_MS 15000UL
 #define TIME_VALID_THRESHOLD 1700000000UL
 #define MQTT_BACKOFF_MAX_MS 60000UL
-#define DOOR_DEBOUNCE_MS 1000UL
+
+#define T_FULL_MS 16000UL
+#define T_FULL_MARGIN_MS 1000UL
+#define T_LEAD_DEFAULT_MS 1500UL
+#define FLASH_TIMEOUT_MS 1200UL
+#define REVERSE_MARGIN_MS 2000UL
+#define REED_DEBOUNCE_MS 50UL
+#define MOVE_PUBLISH_INTERVAL 1000UL
+
 #define DOOR_PULSE_MS 500UL
 #define TEMPERATURE_INTERVAL 60000UL
 #define DIAG_INTERVAL 900000UL
@@ -40,6 +48,8 @@
 #define GARAGE_STATUS_BADSIG 3
 
 void MQTTMessageReceive(char* topic, uint8_t* payload, unsigned int length);
+
+enum DoorState { DoorUnknown, DoorClosed, DoorOpening, DoorOpen, DoorClosing, DoorStopped };
 
 #pragma pack(push, 1)
 struct DiagData {
@@ -54,9 +64,11 @@ struct DiagData {
   int8_t   rssi;
   uint16_t fwVersion;
   uint16_t otaFailCount;
+  uint16_t lastTravelMs;
+  uint16_t lastLeadMs;
 };
 #pragma pack(pop)
-static_assert(sizeof(DiagData) == 21, "DiagData wire layout must stay 21 bytes");
+static_assert(sizeof(DiagData) == 25, "DiagData wire layout must stay 25 bytes");
 
 WiFiClientSecure net;
 PubSubClient mqtt(net);
@@ -64,27 +76,42 @@ Preferences preferences;
 AM2302::AM2302_Sensor am2302{ TEMPERATURE_SENSOR_PIN };
 
 unsigned long currentMillis = 0;
-unsigned long doorChangeTime = 0;
 unsigned long doorPulseStart = 0;
 unsigned long mqttConnectionTimeout = 0;
 unsigned long mqttLastConnectionTry = 0;
 unsigned long temperatureHumidityReadMillis = 0;
 unsigned long lastDiagSendMillis = 0;
+unsigned long lastStatePublish = 0;
 
-int doorState = HIGH;
-int moveState = HIGH;
 bool doorSignal = false;
 bool doorPulseActive = false;
-bool doorMoveDetected = false;
 bool timeSynced = false;
 
-portMUX_TYPE flashMux = portMUX_INITIALIZER_UNLOCKED;
-volatile bool doorFlashSeen = false;
+DoorState doorState = DoorUnknown;
+int8_t lastDirection = 0;
+unsigned long travelMs = 0;
+unsigned long travelBase = 0;
+unsigned long movementOrigin = 0;
+bool movementOriginValid = false;
+bool moving = false;
+bool awaitingReed = false;
+bool travelFromClosed = false;
+unsigned long leadMs = T_LEAD_DEFAULT_MS;
+uint16_t measuredTravelMs = 0;
+uint16_t measuredLeadMs = 0;
+
+volatile unsigned long lastFlashMillis = 0;
+bool flashActive = false;
+unsigned long burstStartMillis = 0;
+
+int reedStable = HIGH;
+int reedRaw = HIGH;
+unsigned long reedRawChangeAt = 0;
 
 char temperatureData[20];
 uint16_t sensorId = 0;
 
-DiagData currentDiagData = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+DiagData currentDiagData = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 uint16_t otaFailures = 0;
 
 uint8_t signingKey[GARAGE_KEY_LEN];
@@ -145,15 +172,196 @@ static bool cryptoSelfTest() {
 }
 
 void IRAM_ATTR OnDoorFlash() {
-  doorFlashSeen = true;
+  lastFlashMillis = millis();
 }
 
-static bool TakeDoorFlash() {
-  portENTER_CRITICAL(&flashMux);
-  bool seen = doorFlashSeen;
-  doorFlashSeen = false;
-  portEXIT_CRITICAL(&flashMux);
-  return seen;
+static unsigned long currentTravel()
+{
+  if(!moving || !movementOriginValid)
+  {
+    return travelMs;
+  }
+  long delta = (long)(currentMillis - movementOrigin);
+  if(delta <= 0)
+  {
+    return travelBase;
+  }
+  unsigned long elapsed = (unsigned long)delta;
+  if(lastDirection > 0)
+  {
+    unsigned long t = travelBase + elapsed;
+    return t > T_FULL_MS ? T_FULL_MS : t;
+  }
+  if(lastDirection < 0)
+  {
+    return elapsed >= travelBase ? 0 : travelBase - elapsed;
+  }
+  return travelBase;
+}
+
+static int positionPercent()
+{
+  if(doorState == DoorUnknown)
+  {
+    return -1;
+  }
+  return (int)((currentTravel() * 100UL) / T_FULL_MS);
+}
+
+static const char* motionText()
+{
+  if(!moving)
+  {
+    return "Stop";
+  }
+  if(lastDirection > 0)
+  {
+    return "Opening";
+  }
+  if(lastDirection < 0)
+  {
+    return "Closing";
+  }
+  return "Move";
+}
+
+void PublishDoorState()
+{
+  char payload[24];
+  sprintf(payload, "%s;%s;%d", reedStable == HIGH ? "Closed" : "Open", motionText(), positionPercent());
+  mqtt.publish(GARAGE_STATE, payload, true);
+  lastStatePublish = currentMillis;
+}
+
+void OnMovementStart(unsigned long firstFlashAt)
+{
+  burstStartMillis = firstFlashAt;
+  travelBase = travelMs;
+  travelFromClosed = false;
+  awaitingReed = false;
+  movementOriginValid = false;
+  moving = true;
+
+  if(doorState == DoorClosed)
+  {
+    lastDirection = 1;
+    doorState = DoorOpening;
+    travelBase = 0;
+    awaitingReed = true;
+  }
+  else if(doorState == DoorOpen)
+  {
+    lastDirection = -1;
+    doorState = DoorClosing;
+    movementOrigin = firstFlashAt + leadMs;
+    movementOriginValid = true;
+  }
+  else if(doorState == DoorStopped && lastDirection != 0)
+  {
+    lastDirection = lastDirection > 0 ? -1 : 1;
+    doorState = lastDirection > 0 ? DoorOpening : DoorClosing;
+    movementOrigin = firstFlashAt + leadMs;
+    movementOriginValid = true;
+  }
+  else
+  {
+    lastDirection = 0;
+    doorState = DoorUnknown;
+  }
+  PublishDoorState();
+}
+
+void OnMovementEnd(unsigned long lastFlashAt)
+{
+  moving = false;
+  if(movementOriginValid)
+  {
+    long delta = (long)(lastFlashAt - movementOrigin);
+    unsigned long elapsed = delta > 0 ? (unsigned long)delta : 0;
+    if(lastDirection > 0)
+    {
+      travelMs = travelBase + elapsed;
+      if(travelMs > T_FULL_MS)
+      {
+        travelMs = T_FULL_MS;
+      }
+      if(travelFromClosed)
+      {
+        measuredTravelMs = elapsed > 65535UL ? 65535 : (uint16_t)elapsed;
+      }
+    }
+    else if(lastDirection < 0)
+    {
+      if(elapsed > travelBase + REVERSE_MARGIN_MS)
+      {
+        travelMs = T_FULL_MS;
+        lastDirection = 1;
+        currentDiagData.sensorErr |= 0x02;
+      }
+      else
+      {
+        travelMs = elapsed >= travelBase ? 0 : travelBase - elapsed;
+      }
+    }
+  }
+  movementOriginValid = false;
+  awaitingReed = false;
+  travelFromClosed = false;
+
+  if(reedStable == HIGH)
+  {
+    travelMs = 0;
+    doorState = DoorClosed;
+  }
+  else if(lastDirection == 0)
+  {
+    doorState = DoorUnknown;
+  }
+  else if(travelMs + T_FULL_MARGIN_MS >= T_FULL_MS)
+  {
+    travelMs = T_FULL_MS;
+    doorState = DoorOpen;
+  }
+  else
+  {
+    doorState = DoorStopped;
+  }
+  PublishDoorState();
+}
+
+void OnReedChanged(unsigned long edgeAt)
+{
+  if(reedStable == HIGH)
+  {
+    travelMs = 0;
+    travelBase = 0;
+    movementOriginValid = false;
+    awaitingReed = false;
+    travelFromClosed = false;
+    doorState = DoorClosed;
+  }
+  else
+  {
+    if(currentDiagData.doorCycles < 0xFFFF)
+    {
+      currentDiagData.doorCycles++;
+    }
+    if(awaitingReed)
+    {
+      awaitingReed = false;
+      movementOrigin = edgeAt;
+      movementOriginValid = true;
+      travelBase = 0;
+      travelFromClosed = true;
+      long lead = (long)(edgeAt - burstStartMillis);
+      if(lead > 0)
+      {
+        leadMs = (unsigned long)lead;
+        measuredLeadMs = lead > 65535L ? 65535 : (uint16_t)lead;
+      }
+    }
+  }
+  PublishDoorState();
 }
 
 static void publishChallenge(uint32_t r) {
@@ -223,26 +431,6 @@ void MQTTMessageReceive(char* topic, uint8_t* payload, unsigned int length)
   }
 }
 
-void PublishDoorState(int state, int movement)
-{
-  if (state == HIGH && movement == HIGH)
-  {
-    mqtt.publish(GARAGE_STATE, "Closed;Stop", true);
-  }
-  if (state == LOW && movement == HIGH)
-  {
-    mqtt.publish(GARAGE_STATE, "Open;Stop", true);
-  }
-  if (state == HIGH && movement == LOW)
-  {
-    mqtt.publish(GARAGE_STATE, "Closed;Move", true);
-  }
-  if (state == LOW && movement == LOW)
-  {
-    mqtt.publish(GARAGE_STATE, "Open;Move", true);
-  }
-}
-
 bool SyncTime()
 {
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
@@ -307,7 +495,7 @@ bool Connect()
   }
   mqtt.subscribe(GARAGE_OPEN_REQUEST, 1);
   mqtt.subscribe(GARAGE_OPEN_RESPONSE, 1);
-  PublishDoorState(doorState, moveState);
+  PublishDoorState();
   mqttConnectionTimeout = 0;
   return true;
 }
@@ -319,6 +507,8 @@ void sendDiag()
   currentDiagData.rssi = (int8_t)WiFi.RSSI();
   currentDiagData.fwVersion = (uint16_t)FW_VERSION;
   currentDiagData.otaFailCount = otaFailures;
+  currentDiagData.lastTravelMs = measuredTravelMs;
+  currentDiagData.lastLeadMs = measuredLeadMs;
   mqtt.publish(GARAGE_DIAG, (const uint8_t*)&currentDiagData, sizeof(DiagData), false);
   currentDiagData.loopMaxMs = 0;
   currentDiagData.sensorErr = 0;
@@ -326,8 +516,8 @@ void sendDiag()
 
 bool OtaAllowed()
 {
-  return doorState == HIGH
-    && moveState == HIGH
+  return doorState == DoorClosed
+    && !moving
     && !doorPulseActive
     && !doorSignal
     && !openSlot.valid
@@ -369,7 +559,9 @@ void setup() {
     delay(3000);
   }
 
-  doorState = digitalRead(DOORSWITCH_PIN);
+  reedRaw = digitalRead(DOORSWITCH_PIN);
+  reedStable = reedRaw;
+  doorState = reedStable == HIGH ? DoorClosed : DoorUnknown;
   randomSeed(esp_random());
 
   if (!parseSigningKey()) {
@@ -397,26 +589,39 @@ void loop() {
   }
   mqtt.loop();
 
-  if(TakeDoorFlash() || digitalRead(DOORFLASH_PIN) == LOW)
+  if(digitalRead(DOORFLASH_PIN) == LOW)
   {
-    doorMoveDetected = true;
+    lastFlashMillis = currentMillis;
+  }
+  unsigned long flashAt = lastFlashMillis;
+  bool nowFlashing = flashAt != 0 && currentMillis - flashAt < FLASH_TIMEOUT_MS;
+
+  int raw = digitalRead(DOORSWITCH_PIN);
+  if(raw != reedRaw)
+  {
+    reedRaw = raw;
+    reedRawChangeAt = currentMillis;
+  }
+  else if(reedStable != reedRaw && currentMillis - reedRawChangeAt >= REED_DEBOUNCE_MS)
+  {
+    reedStable = reedRaw;
+    OnReedChanged(reedRawChangeAt);
   }
 
-  if(currentMillis - doorChangeTime > DOOR_DEBOUNCE_MS)
+  if(nowFlashing && !flashActive)
   {
-    int doorValue = digitalRead(DOORSWITCH_PIN);
-    if(doorValue != doorState || (doorMoveDetected && moveState == HIGH) || (!doorMoveDetected && moveState == LOW))
-    {
-      if(doorState == HIGH && doorValue == LOW && currentDiagData.doorCycles < 0xFFFF)
-      {
-        currentDiagData.doorCycles++;
-      }
-      doorState = doorValue;
-      moveState = doorMoveDetected? LOW : HIGH;
-      PublishDoorState(doorState, moveState);
-    }
-    doorChangeTime = currentMillis;
-    doorMoveDetected = false;
+    flashActive = true;
+    OnMovementStart(flashAt);
+  }
+  else if(!nowFlashing && flashActive)
+  {
+    flashActive = false;
+    OnMovementEnd(flashAt);
+  }
+
+  if(moving && currentMillis - lastStatePublish >= MOVE_PUBLISH_INTERVAL)
+  {
+    PublishDoorState();
   }
 
   processHandshake();
