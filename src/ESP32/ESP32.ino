@@ -6,6 +6,7 @@
 #include "time.h"
 #include "esp_task_wdt.h"
 #include "esp_random.h"
+#include "esp_timer.h"
 #include "config.h"
 #include "secret.h"
 #include "crypto.h"
@@ -31,6 +32,9 @@
 #define TIME_VALID_THRESHOLD 1700000000UL
 #define MQTT_BACKOFF_MAX_MS 60000UL
 #define MQTT_KEEPALIVE_S 60
+#define STATE_PAYLOAD_LEN 32
+#define DOORBUTTON_ACTIVE LOW
+#define DOORBUTTON_IDLE (DOORBUTTON_ACTIVE == LOW ? HIGH : LOW)
 
 #define T_FULL_MS 16000UL
 #define T_FULL_MARGIN_MS 1000UL
@@ -111,7 +115,7 @@ int reedRaw = HIGH;
 unsigned long reedRawChangeAt = 0;
 
 char temperatureData[20];
-char lastPayload[24] = "";
+char lastPayload[STATE_PAYLOAD_LEN] = "";
 uint16_t sensorId = 0;
 
 DiagData currentDiagData = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
@@ -154,9 +158,16 @@ static bool isHexChar(char c) {
 
 static bool parseSigningKey() {
   const char* h = SigningKeyHex;
-  if (strnlen(h, GARAGE_KEY_LEN * 2 + 2) != (size_t)(GARAGE_KEY_LEN * 2)) return false;
+  size_t len = strnlen(h, GARAGE_KEY_LEN * 2 + 2);
+  if (len != (size_t)(GARAGE_KEY_LEN * 2)) {
+    Serial.printf("SigningKey: delka %u znaku, ocekavano %u\n", (unsigned)len, (unsigned)(GARAGE_KEY_LEN * 2));
+    return false;
+  }
   for (uint8_t i = 0; i < GARAGE_KEY_LEN * 2; i++) {
-    if (!isHexChar(h[i])) return false;
+    if (!isHexChar(h[i])) {
+      Serial.printf("SigningKey: nehexadecimalni znak na pozici %u\n", (unsigned)i);
+      return false;
+    }
   }
   for (uint8_t i = 0; i < GARAGE_KEY_LEN; i++) {
     signingKey[i] = (hexNibble(h[i * 2]) << 4) | hexNibble(h[i * 2 + 1]);
@@ -230,14 +241,14 @@ static const char* motionText()
 
 void PublishDoorState(bool force)
 {
-  char payload[24];
-  sprintf(payload, "%s;%s;%d", reedStable == HIGH ? "Closed" : "Open", motionText(), positionPercent());
+  char payload[STATE_PAYLOAD_LEN];
+  snprintf(payload, sizeof payload, "%s;%s;%d", reedStable == HIGH ? "Closed" : "Open", motionText(), positionPercent());
   lastStatePublish = currentMillis;
   if(!force && strcmp(payload, lastPayload) == 0)
   {
     return;
   }
-  strcpy(lastPayload, payload);
+  strlcpy(lastPayload, payload, sizeof lastPayload);
   mqtt.publish(GARAGE_STATE, payload, true);
 }
 
@@ -510,7 +521,7 @@ bool Connect()
 
 void sendDiag()
 {
-  currentDiagData.uptime = currentMillis / 60000UL;
+  currentDiagData.uptime = (uint32_t)(esp_timer_get_time() / 60000000LL);
   currentDiagData.freeRamKb = (uint16_t)(ESP.getFreeHeap() / 1024);
   currentDiagData.rssi = (int8_t)WiFi.RSSI();
   currentDiagData.fwVersion = (uint16_t)FW_VERSION;
@@ -536,9 +547,9 @@ bool OtaAllowed()
 void setup() {
   currentDiagData.resetReason = (uint8_t)esp_reset_reason();
 
-  digitalWrite(DOORBUTTON_PIN, HIGH);
+  gpio_set_level((gpio_num_t)DOORBUTTON_PIN, DOORBUTTON_IDLE);
   pinMode(DOORBUTTON_PIN, OUTPUT);
-  digitalWrite(DOORBUTTON_PIN, HIGH);
+  digitalWrite(DOORBUTTON_PIN, DOORBUTTON_IDLE);
 
   pinMode(DOORSWITCH_PIN, INPUT_PULLUP);
   pinMode(DOORFLASH_PIN, INPUT_PULLUP);
@@ -636,14 +647,14 @@ void loop() {
 
   if(doorSignal && !doorPulseActive)
   {
-    digitalWrite(DOORBUTTON_PIN, LOW);
+    digitalWrite(DOORBUTTON_PIN, DOORBUTTON_ACTIVE);
     doorPulseStart = currentMillis;
     doorPulseActive = true;
     doorSignal = false;
   }
   if(doorPulseActive && currentMillis - doorPulseStart >= DOOR_PULSE_MS)
   {
-    digitalWrite(DOORBUTTON_PIN, HIGH);
+    digitalWrite(DOORBUTTON_PIN, DOORBUTTON_IDLE);
     doorPulseActive = false;
   }
 
