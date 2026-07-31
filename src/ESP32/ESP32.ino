@@ -30,6 +30,7 @@
 #define TIME_SYNC_TIMEOUT_MS 15000UL
 #define TIME_VALID_THRESHOLD 1700000000UL
 #define MQTT_BACKOFF_MAX_MS 60000UL
+#define MQTT_KEEPALIVE_S 60
 
 #define T_FULL_MS 16000UL
 #define T_FULL_MARGIN_MS 1000UL
@@ -48,6 +49,7 @@
 #define GARAGE_STATUS_BADSIG 3
 
 void MQTTMessageReceive(char* topic, uint8_t* payload, unsigned int length);
+void PublishDoorState(bool force = false);
 
 enum DoorState { DoorUnknown, DoorClosed, DoorOpening, DoorOpen, DoorClosing, DoorStopped };
 
@@ -109,6 +111,7 @@ int reedRaw = HIGH;
 unsigned long reedRawChangeAt = 0;
 
 char temperatureData[20];
+char lastPayload[24] = "";
 uint16_t sensorId = 0;
 
 DiagData currentDiagData = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
@@ -181,7 +184,7 @@ static unsigned long currentTravel()
   {
     return travelMs;
   }
-  long delta = (long)(currentMillis - movementOrigin);
+  long delta = (long)(lastFlashMillis - movementOrigin);
   if(delta <= 0)
   {
     return travelBase;
@@ -225,12 +228,17 @@ static const char* motionText()
   return "Move";
 }
 
-void PublishDoorState()
+void PublishDoorState(bool force)
 {
   char payload[24];
   sprintf(payload, "%s;%s;%d", reedStable == HIGH ? "Closed" : "Open", motionText(), positionPercent());
-  mqtt.publish(GARAGE_STATE, payload, true);
   lastStatePublish = currentMillis;
+  if(!force && strcmp(payload, lastPayload) == 0)
+  {
+    return;
+  }
+  strcpy(lastPayload, payload);
+  mqtt.publish(GARAGE_STATE, payload, true);
 }
 
 void OnMovementStart(unsigned long firstFlashAt)
@@ -495,7 +503,7 @@ bool Connect()
   }
   mqtt.subscribe(GARAGE_OPEN_REQUEST, 1);
   mqtt.subscribe(GARAGE_OPEN_RESPONSE, 1);
-  PublishDoorState();
+  PublishDoorState(true);
   mqttConnectionTimeout = 0;
   return true;
 }
@@ -552,7 +560,7 @@ void setup() {
   mqtt.setServer(MQTTHost, MQTT_TLS_PORT);
   mqtt.setCallback(MQTTMessageReceive);
   mqtt.setBufferSize(256);
-  mqtt.setKeepAlive(60);
+  mqtt.setKeepAlive(MQTT_KEEPALIVE_S);
 
   if (am2302.begin())
   {
@@ -646,8 +654,8 @@ void loop() {
     {
       currentDiagData.sensorErr |= 0x01;
     }
-    int temperature = (int)(am2302.get_Temperature() * 10);
-    int humidity = (int)am2302.get_Humidity();
+    int temperature = (int)lroundf(am2302.get_Temperature() * 10);
+    int humidity = (int)lroundf(am2302.get_Humidity());
     sprintf(temperatureData, "%u;%d;%d;%d", sensorId, temperature, humidity, SENSOR_CHANNEL);
     mqtt.publish(GARAGE_TEMPERATURE, temperatureData);
     temperatureHumidityReadMillis = currentMillis;
