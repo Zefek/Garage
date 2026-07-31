@@ -38,3 +38,39 @@ jobs:
         run: |
           arduino-cli compile ./src/Arduino
           arduino-cli compile ./src/ESP32
+
+      - name: Install cppcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cppcheck
+
+      - name: Static analysis (ESP32)
+        run: |
+          cppcheck --version
+          cppcheck \
+            --enable=warning,style,performance,portability \
+            --language=c++ \
+            --std=c++20 \
+            --platform=unix32 \
+            --inline-suppr \
+            --suppress=missingInclude \
+            --suppress=missingIncludeSystem \
+            --suppress=constParameterCallback:./src/ESP32/ESP32.ino \
+            --error-exitcode=1 \
+            -I ./src/ESP32 \
+            ./src/ESP32/ESP32.ino ./src/ESP32/crypto.cpp ./src/ESP32/ota.cpp
+
+      - name: Static analysis (Arduino)
+        run: |
+          cppcheck \
+            --enable=warning,performance,portability \
+            --language=c++ \
+            --std=c++11 \
+            --platform=avr8 \
+            --inline-suppr \
+            -D PROGMEM= \
+            --suppress=missingInclude \
+            --suppress=missingIncludeSystem \
+            --error-exitcode=1 \
+            -I ./src/Arduino \
+            ./src/Arduino/Arduino.ino ./src/Arduino/sha256.cpp

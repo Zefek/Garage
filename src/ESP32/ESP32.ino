@@ -177,7 +177,8 @@ static bool parseSigningKey() {
 
 static bool cryptoSelfTest() {
   uint8_t mac[32];
-  hmac_sha256((const uint8_t*)"Jefe", 4, (const uint8_t*)"what do ya want for nothing?", 28, mac);
+  hmac_sha256(reinterpret_cast<const uint8_t*>("Jefe"), 4,
+              reinterpret_cast<const uint8_t*>("what do ya want for nothing?"), 28, mac);
   const uint8_t expected[8] = { 0x5b, 0xdc, 0xc1, 0x46, 0xbf, 0x60, 0x75, 0x4e };
   for (uint8_t i = 0; i < 8; i++) {
     if (mac[i] != expected[i]) return false;
@@ -528,7 +529,7 @@ void sendDiag()
   currentDiagData.otaFailCount = otaFailures;
   currentDiagData.lastTravelMs = measuredTravelMs;
   currentDiagData.lastLeadMs = measuredLeadMs;
-  mqtt.publish(GARAGE_DIAG, (const uint8_t*)&currentDiagData, sizeof(DiagData), false);
+  mqtt.publish(GARAGE_DIAG, reinterpret_cast<const uint8_t*>(&currentDiagData), sizeof(DiagData), false);
   currentDiagData.loopMaxMs = 0;
   currentDiagData.sensorErr = 0;
 }
