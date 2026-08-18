@@ -4,6 +4,7 @@
 #include <Preferences.h>
 #include <AM2302-Sensor.h>
 #include "time.h"
+#include "esp_sntp.h"
 #include "esp_task_wdt.h"
 #include "esp_random.h"
 #include "esp_timer.h"
@@ -30,6 +31,8 @@
 #define WIFI_CONNECT_TIMEOUT_MS 15000UL
 #define TIME_SYNC_TIMEOUT_MS 15000UL
 #define TIME_VALID_THRESHOLD 1700000000UL
+#define NTP_SERVER_1 "pool.ntp.org"
+#define NTP_SERVER_2 "time.nist.gov"
 #define MQTT_BACKOFF_MAX_MS 60000UL
 #define MQTT_KEEPALIVE_S 60
 #define STATE_PAYLOAD_LEN 32
@@ -42,6 +45,7 @@
 #define FLASH_TIMEOUT_MS 1200UL
 #define REVERSE_MARGIN_MS 2000UL
 #define REED_DEBOUNCE_MS 50UL
+#define REED_DEBOUNCE_SAMPLES 3
 #define MOVE_PUBLISH_INTERVAL 1000UL
 
 #define DOOR_PULSE_MS 500UL
@@ -92,6 +96,7 @@ unsigned long lastStatePublish = 0;
 bool doorSignal = false;
 bool doorPulseActive = false;
 bool timeSynced = false;
+char ntpFromDhcp[16] = "";
 
 DoorState doorState = DoorUnknown;
 int8_t lastDirection = 0;
@@ -112,7 +117,9 @@ unsigned long burstStartMillis = 0;
 
 int reedStable = HIGH;
 int reedRaw = HIGH;
+int reedSamples = 0;
 unsigned long reedRawChangeAt = 0;
+unsigned long reedLastSampleAt = 0;
 
 char temperatureData[20];
 char lastPayload[STATE_PAYLOAD_LEN] = "";
@@ -407,6 +414,7 @@ static void processHandshake() {
     openSlot.correlationId = r;
     openSlot.valid = true;
     publishChallenge(r);
+    Serial.printf("HANDSHAKE: request R=%lu, challenge odeslana\n", (unsigned long)r);
   }
   if (responsePending) {
     responsePending = false;
@@ -434,6 +442,7 @@ static void processHandshake() {
       }
     }
     publishResult(r, status);
+    Serial.printf("HANDSHAKE: response R=%lu, status=%u\n", (unsigned long)r, (unsigned)status);
   }
 }
 
@@ -453,7 +462,20 @@ void MQTTMessageReceive(char* topic, uint8_t* payload, unsigned int length)
 
 bool SyncTime()
 {
-  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  const ip_addr_t* dhcpServer = esp_sntp_getserver(0);
+  if(dhcpServer != NULL && !ip_addr_isany_val(*dhcpServer))
+  {
+    snprintf(ntpFromDhcp, sizeof(ntpFromDhcp), "%s", ipaddr_ntoa(dhcpServer));
+  }
+  if(ntpFromDhcp[0] != '\0')
+  {
+    Serial.printf("NTP z DHCP: %s\n", ntpFromDhcp);
+    configTime(0, 0, ntpFromDhcp, NTP_SERVER_1, NTP_SERVER_2);
+  }
+  else
+  {
+    configTime(0, 0, NTP_SERVER_1, NTP_SERVER_2);
+  }
   unsigned long start = millis();
   time_t now = time(nullptr);
   while(now < TIME_VALID_THRESHOLD && millis() - start < TIME_SYNC_TIMEOUT_MS)
@@ -567,6 +589,7 @@ void setup() {
   }
 
   WiFi.mode(WIFI_STA);
+  esp_sntp_servermode_dhcp(true);
   WiFi.begin(WifiSSID, WifiPassword);
   net.setCACert(MQTTCACert);
   mqtt.setServer(MQTTHost, MQTT_TLS_PORT);
@@ -616,16 +639,41 @@ void loop() {
   unsigned long flashAt = lastFlashMillis;
   bool nowFlashing = flashAt != 0 && currentMillis - flashAt < FLASH_TIMEOUT_MS;
 
+  unsigned long reedNow = millis();
+  unsigned long reedGap = reedNow - reedLastSampleAt;
+  reedLastSampleAt = reedNow;
   int raw = digitalRead(DOORSWITCH_PIN);
-  if(raw != reedRaw)
+
+  if(reedGap > REED_DEBOUNCE_MS)
+  {
+    if(reedStable != reedRaw)
+    {
+      currentDiagData.sensorErr |= 0x04;
+      Serial.printf("REED: debounce zahozen po %lu ms bez vzorku\n", reedGap);
+    }
+    reedRaw = raw;
+    reedRawChangeAt = reedNow;
+    reedSamples = 1;
+  }
+  else if(raw != reedRaw)
   {
     reedRaw = raw;
-    reedRawChangeAt = currentMillis;
+    reedRawChangeAt = reedNow;
+    reedSamples = 1;
   }
-  else if(reedStable != reedRaw && currentMillis - reedRawChangeAt >= REED_DEBOUNCE_MS)
+  else
   {
-    reedStable = reedRaw;
-    OnReedChanged(reedRawChangeAt);
+    if(reedSamples < REED_DEBOUNCE_SAMPLES)
+    {
+      reedSamples++;
+    }
+    if(reedStable != reedRaw
+       && reedSamples >= REED_DEBOUNCE_SAMPLES
+       && reedNow - reedRawChangeAt >= REED_DEBOUNCE_MS)
+    {
+      reedStable = reedRaw;
+      OnReedChanged(reedRawChangeAt);
+    }
   }
 
   if(nowFlashing && !flashActive)
@@ -652,11 +700,13 @@ void loop() {
     doorPulseStart = currentMillis;
     doorPulseActive = true;
     doorSignal = false;
+    Serial.printf("PULZ: GPIO%d -> %d (start, %lu ms)\n", DOORBUTTON_PIN, DOORBUTTON_ACTIVE, DOOR_PULSE_MS);
   }
   if(doorPulseActive && currentMillis - doorPulseStart >= DOOR_PULSE_MS)
   {
     digitalWrite(DOORBUTTON_PIN, DOORBUTTON_IDLE);
     doorPulseActive = false;
+    Serial.printf("PULZ: GPIO%d -> %d (konec), digitalRead=%d\n", DOORBUTTON_PIN, DOORBUTTON_IDLE, digitalRead(DOORBUTTON_PIN));
   }
 
   if(currentMillis - temperatureHumidityReadMillis > TEMPERATURE_INTERVAL)
