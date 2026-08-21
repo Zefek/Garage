@@ -22,7 +22,7 @@ jobs:
     with:
       environment: ${{ inputs.environment }}
       serial_port: ${{ inputs.serial_port }}
-      device_name: GarageESP32
+      device_name: Garage
       source_dir:  "./src/ESP32"
       ota:         true
     secrets: inherit
