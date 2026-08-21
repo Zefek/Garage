@@ -17,16 +17,12 @@
 #define FW_VERSION 0
 #endif
 
-#define SENSOR_CHANNEL 4
-#define DEFAULT_SENSOR_ID 39033
 
 #define DOORSWITCH_PIN 22
 #define DOORBUTTON_PIN 23
 #define DOORFLASH_PIN 21
 #define TEMPERATURE_SENSOR_PIN 19
 
-#define MQTT_CLIENT_ID "GarageESP32"
-#define MQTT_TLS_PORT 8883
 #define WDT_TIMEOUT_S 90
 #define WIFI_CONNECT_TIMEOUT_MS 15000UL
 #define TIME_SYNC_TIMEOUT_MS 15000UL
@@ -39,16 +35,10 @@
 #define DOORBUTTON_ACTIVE LOW
 #define DOORBUTTON_IDLE (DOORBUTTON_ACTIVE == LOW ? HIGH : LOW)
 
-#define T_FULL_MS 16000UL
-#define T_FULL_MARGIN_MS 1000UL
-#define T_LEAD_DEFAULT_MS 1500UL
-#define FLASH_TIMEOUT_MS 1200UL
-#define REVERSE_MARGIN_MS 2000UL
 #define REED_DEBOUNCE_MS 50UL
 #define REED_DEBOUNCE_SAMPLES 3
 #define MOVE_PUBLISH_INTERVAL 1000UL
 
-#define DOOR_PULSE_MS 500UL
 #define TEMPERATURE_INTERVAL 60000UL
 #define DIAG_INTERVAL 900000UL
 
@@ -76,9 +66,10 @@ struct DiagData {
   uint16_t otaFailCount;
   uint16_t lastTravelMs;
   uint16_t lastLeadMs;
+  uint16_t lastCloseMs;
 };
 #pragma pack(pop)
-static_assert(sizeof(DiagData) == 25, "DiagData wire layout must stay 25 bytes");
+static_assert(sizeof(DiagData) == 27, "DiagData wire layout must stay 27 bytes");
 
 WiFiClientSecure net;
 PubSubClient mqtt(net);
@@ -107,9 +98,11 @@ bool movementOriginValid = false;
 bool moving = false;
 bool awaitingReed = false;
 bool travelFromClosed = false;
+bool travelFromOpen = false;
 unsigned long leadMs = T_LEAD_DEFAULT_MS;
 uint16_t measuredTravelMs = 0;
 uint16_t measuredLeadMs = 0;
+uint16_t measuredCloseMs = 0;
 
 volatile unsigned long lastFlashMillis = 0;
 bool flashActive = false;
@@ -125,7 +118,7 @@ char temperatureData[20];
 char lastPayload[STATE_PAYLOAD_LEN] = "";
 uint16_t sensorId = 0;
 
-DiagData currentDiagData = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+DiagData currentDiagData = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 uint16_t otaFailures = 0;
 
 uint8_t signingKey[GARAGE_KEY_LEN];
@@ -197,6 +190,11 @@ void IRAM_ATTR OnDoorFlash() {
   lastFlashMillis = millis();
 }
 
+static unsigned long closingToOpeningUnits(unsigned long elapsed)
+{
+  return (unsigned long)((uint64_t)elapsed * T_FULL_MS / T_FULL_CLOSE_MS);
+}
+
 static unsigned long currentTravel()
 {
   if(!moving || !movementOriginValid)
@@ -216,7 +214,8 @@ static unsigned long currentTravel()
   }
   if(lastDirection < 0)
   {
-    return elapsed >= travelBase ? 0 : travelBase - elapsed;
+    unsigned long covered = closingToOpeningUnits(elapsed);
+    return covered >= travelBase ? 0 : travelBase - covered;
   }
   return travelBase;
 }
@@ -257,14 +256,18 @@ void PublishDoorState(bool force)
     return;
   }
   strlcpy(lastPayload, payload, sizeof lastPayload);
-  mqtt.publish(GARAGE_STATE, payload, true);
+  bool ok = mqtt.publish(GARAGE_STATE, payload, true);
+  Serial.printf("MQTT: publish %s -> \"%s\" %s (stav spojeni %d)\n",
+                GARAGE_STATE, payload, ok ? "OK" : "SELHALO", mqtt.state());
 }
 
 void OnMovementStart(unsigned long firstFlashAt)
 {
   burstStartMillis = firstFlashAt;
   travelBase = travelMs;
+  Serial.printf("POHYB: start (stav=%d, travelMs=%lu)\n", (int)doorState, travelMs);
   travelFromClosed = false;
+  travelFromOpen = false;
   awaitingReed = false;
   movementOriginValid = false;
   moving = true;
@@ -282,6 +285,7 @@ void OnMovementStart(unsigned long firstFlashAt)
     doorState = DoorClosing;
     movementOrigin = firstFlashAt + leadMs;
     movementOriginValid = true;
+    travelFromOpen = true;
   }
   else if(doorState == DoorStopped && lastDirection != 0)
   {
@@ -301,6 +305,8 @@ void OnMovementStart(unsigned long firstFlashAt)
 void OnMovementEnd(unsigned long lastFlashAt)
 {
   moving = false;
+  unsigned long openingElapsed = 0;
+  bool openingFromClosed = false;
   if(movementOriginValid)
   {
     long delta = (long)(lastFlashAt - movementOrigin);
@@ -312,14 +318,13 @@ void OnMovementEnd(unsigned long lastFlashAt)
       {
         travelMs = T_FULL_MS;
       }
-      if(travelFromClosed)
-      {
-        measuredTravelMs = elapsed > 65535UL ? 65535 : (uint16_t)elapsed;
-      }
+      openingElapsed = elapsed;
+      openingFromClosed = travelFromClosed;
     }
     else if(lastDirection < 0)
     {
-      if(elapsed > travelBase + REVERSE_MARGIN_MS)
+      unsigned long covered = closingToOpeningUnits(elapsed);
+      if(covered > travelBase + REVERSE_MARGIN_MS)
       {
         travelMs = T_FULL_MS;
         lastDirection = 1;
@@ -327,13 +332,14 @@ void OnMovementEnd(unsigned long lastFlashAt)
       }
       else
       {
-        travelMs = elapsed >= travelBase ? 0 : travelBase - elapsed;
+        travelMs = covered >= travelBase ? 0 : travelBase - covered;
       }
     }
   }
   movementOriginValid = false;
   awaitingReed = false;
   travelFromClosed = false;
+  travelFromOpen = false;
 
   if(reedStable == HIGH)
   {
@@ -353,18 +359,38 @@ void OnMovementEnd(unsigned long lastFlashAt)
   {
     doorState = DoorStopped;
   }
+
+  if(doorState == DoorOpen && openingFromClosed && openingElapsed > 0)
+  {
+    measuredTravelMs = openingElapsed > 65535UL ? 65535 : (uint16_t)openingElapsed;
+    Serial.printf("KALIBRACE: otevirani %lu ms\n", openingElapsed);
+  }
+  Serial.printf("POHYB: konec (stav=%d, travelMs=%lu, poloha=%d%%, lastTravel=%u, lastLead=%u, lastClose=%u)\n",
+                (int)doorState, travelMs, positionPercent(), measuredTravelMs, measuredLeadMs, measuredCloseMs);
   PublishDoorState();
 }
 
 void OnReedChanged(unsigned long edgeAt)
 {
+  Serial.printf("REED: %s (t=%lu, stav=%d, awaitingReed=%d)\n",
+                reedStable == HIGH ? "zavreno" : "otevreno", edgeAt, (int)doorState, (int)awaitingReed);
   if(reedStable == HIGH)
   {
+    if(travelFromOpen && movementOriginValid && lastDirection < 0)
+    {
+      long down = (long)(edgeAt - movementOrigin);
+      if(down > 0)
+      {
+        measuredCloseMs = down > 65535L ? 65535 : (uint16_t)down;
+        Serial.printf("KALIBRACE: zavirani %ld ms\n", down);
+      }
+    }
     travelMs = 0;
     travelBase = 0;
     movementOriginValid = false;
     awaitingReed = false;
     travelFromClosed = false;
+    travelFromOpen = false;
     doorState = DoorClosed;
   }
   else
@@ -372,6 +398,15 @@ void OnReedChanged(unsigned long edgeAt)
     if(currentDiagData.doorCycles < 0xFFFF)
     {
       currentDiagData.doorCycles++;
+    }
+    if(!awaitingReed)
+    {
+      travelMs = 0;
+      travelBase = 0;
+      movementOriginValid = false;
+      lastDirection = 0;
+      doorState = DoorUnknown;
+      Serial.printf("REED: opustil zavreno bez rozjezdu -> DoorUnknown\n");
     }
     if(awaitingReed)
     {
@@ -448,15 +483,30 @@ static void processHandshake() {
 
 void MQTTMessageReceive(char* topic, uint8_t* payload, unsigned int length)
 {
-  if(strcmp(topic, GARAGE_OPEN_REQUEST) == 0 && length >= 4)
+  if(strcmp(topic, GARAGE_OPEN_REQUEST) == 0)
   {
-    memcpy(reqBuf, payload, 4);
-    challengePending = true;
+    if(length >= 4)
+    {
+      memcpy(reqBuf, payload, 4);
+      challengePending = true;
+    }
+    else
+    {
+      Serial.printf("HANDSHAKE: request ma %u B, cekano aspon 4\n", length);
+    }
   }
-  else if(strcmp(topic, GARAGE_OPEN_RESPONSE) == 0 && length == sizeof(respBuf))
+  else if(strcmp(topic, GARAGE_OPEN_RESPONSE) == 0)
   {
-    memcpy(respBuf, payload, sizeof(respBuf));
-    responsePending = true;
+    if(length == sizeof(respBuf))
+    {
+      memcpy(respBuf, payload, sizeof(respBuf));
+      responsePending = true;
+    }
+    else
+    {
+      Serial.printf("HANDSHAKE: response ma %u B, cekano %u (GARAGE_SIG_LEN=%d)\n",
+                    length, (unsigned)sizeof(respBuf), GARAGE_SIG_LEN);
+    }
   }
 }
 
@@ -515,6 +565,7 @@ bool Connect()
   if(WiFi.status() != WL_CONNECTED)
   {
     mqttConnectionTimeout = min(mqttConnectionTimeout * 2 + random(0, 5000), MQTT_BACKOFF_MAX_MS);
+    Serial.printf("MQTT: WiFi nepripojeno (status %d), backoff %lu ms\n", (int)WiFi.status(), mqttConnectionTimeout);
     return false;
   }
   if(!timeSynced)
@@ -523,6 +574,7 @@ bool Connect()
     if(!timeSynced)
     {
       mqttConnectionTimeout = min(mqttConnectionTimeout * 2 + random(0, 5000), MQTT_BACKOFF_MAX_MS);
+      Serial.printf("MQTT: NTP sync selhal, backoff %lu ms\n", mqttConnectionTimeout);
       return false;
     }
   }
@@ -533,8 +585,11 @@ bool Connect()
   if(!mqtt.connect(MQTT_CLIENT_ID, MQTTUsername, MQTTPassword))
   {
     mqttConnectionTimeout = min(mqttConnectionTimeout * 2 + random(0, 5000), MQTT_BACKOFF_MAX_MS);
+    Serial.printf("MQTT: connect na %s:%d SELHAL (stav %d), backoff %lu ms\n",
+                  MQTTHost, MQTT_TLS_PORT, mqtt.state(), mqttConnectionTimeout);
     return false;
   }
+  Serial.printf("MQTT: pripojeno jako %s, topic stavu %s\n", MQTT_CLIENT_ID, GARAGE_STATE);
   mqtt.subscribe(GARAGE_OPEN_REQUEST, 1);
   mqtt.subscribe(GARAGE_OPEN_RESPONSE, 1);
   PublishDoorState(true);
@@ -551,6 +606,7 @@ void sendDiag()
   currentDiagData.otaFailCount = otaFailures;
   currentDiagData.lastTravelMs = measuredTravelMs;
   currentDiagData.lastLeadMs = measuredLeadMs;
+  currentDiagData.lastCloseMs = measuredCloseMs;
   mqtt.publish(GARAGE_DIAG, reinterpret_cast<const uint8_t*>(&currentDiagData), sizeof(DiagData), false);
   currentDiagData.loopMaxMs = 0;
   currentDiagData.sensorErr = 0;
@@ -611,6 +667,8 @@ void setup() {
     Serial.println("SigningKey INVALID");
   }
   Serial.println(cryptoSelfTest() ? "HMAC selftest OK" : "HMAC selftest FAIL");
+  Serial.printf("PROTOKOL: nonce=%d B, klic=%d B, podpis=%d B, TTL=%lu ms\n",
+                GARAGE_NONCE_LEN, GARAGE_KEY_LEN, GARAGE_SIG_LEN, (unsigned long)GARAGE_OPEN_TTL);
 
   esp_task_wdt_config_t wdtConfig = {
     .timeout_ms = WDT_TIMEOUT_S * 1000,
@@ -632,18 +690,20 @@ void loop() {
   }
   mqtt.loop();
 
-  if(digitalRead(DOORFLASH_PIN) == LOW)
+  unsigned long flashNow = millis();
+  int flashRaw = digitalRead(DOORFLASH_PIN);
+  if(flashRaw == LOW)
   {
-    lastFlashMillis = currentMillis;
+    lastFlashMillis = flashNow;
   }
   unsigned long flashAt = lastFlashMillis;
-  bool nowFlashing = flashAt != 0 && currentMillis - flashAt < FLASH_TIMEOUT_MS;
+  long flashAge = (long)(flashNow - flashAt);
+  bool nowFlashing = flashAt != 0 && flashAge >= 0 && (unsigned long)flashAge < FLASH_TIMEOUT_MS;
 
   unsigned long reedNow = millis();
   unsigned long reedGap = reedNow - reedLastSampleAt;
   reedLastSampleAt = reedNow;
   int raw = digitalRead(DOORSWITCH_PIN);
-
   if(reedGap > REED_DEBOUNCE_MS)
   {
     if(reedStable != reedRaw)
