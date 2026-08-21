@@ -1,16 +1,16 @@
-name: Deploy Garage on Environment
+name: Deploy Garage ESP32 on Environment
 
 on:
   workflow_dispatch:
     inputs:
+      serial_port:
+        required: false
+        type: string
       environment:
         required: true
         type: choice
         options:
           - Home
-      serial_port:
-        required: false
-        type: string
 
 permissions:
   contents: read
@@ -22,6 +22,7 @@ jobs:
     with:
       environment: ${{ inputs.environment }}
       serial_port: ${{ inputs.serial_port }}
-      device_name: Garage
-      source_dir: "./src/Arduino"
+      device_name: GarageESP32
+      source_dir:  "./src/ESP32"
+      ota:         true
     secrets: inherit

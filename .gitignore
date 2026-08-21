@@ -1,1 +1,3 @@
 secret.h
+config.h
+/tests/__pycache__

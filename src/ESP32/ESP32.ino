@@ -1,0 +1,802 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <Preferences.h>
+#include <AM2302-Sensor.h>
+#include "time.h"
+#include "esp_sntp.h"
+#include "esp_task_wdt.h"
+#include "esp_random.h"
+#include "esp_timer.h"
+#include "config.h"
+#include "secret.h"
+#include "crypto.h"
+#include "ota.h"
+
+#ifndef FW_VERSION
+#define FW_VERSION 0
+#endif
+
+
+#define DOORSWITCH_PIN 22
+#define DOORBUTTON_PIN 23
+#define DOORFLASH_PIN 21
+#define TEMPERATURE_SENSOR_PIN 19
+
+#define WDT_TIMEOUT_S 90
+#define WIFI_CONNECT_TIMEOUT_MS 15000UL
+#define TIME_SYNC_TIMEOUT_MS 15000UL
+#define TIME_VALID_THRESHOLD 1700000000UL
+#define NTP_SERVER_1 "pool.ntp.org"
+#define NTP_SERVER_2 "time.nist.gov"
+#define MQTT_BACKOFF_MAX_MS 60000UL
+#define MQTT_KEEPALIVE_S 60
+#define STATE_PAYLOAD_LEN 32
+#define DOORBUTTON_ACTIVE LOW
+#define DOORBUTTON_IDLE (DOORBUTTON_ACTIVE == LOW ? HIGH : LOW)
+
+#define REED_DEBOUNCE_MS 50UL
+#define REED_DEBOUNCE_SAMPLES 3
+#define MOVE_PUBLISH_INTERVAL 1000UL
+
+#define TEMPERATURE_INTERVAL 60000UL
+#define DIAG_INTERVAL 900000UL
+
+#define GARAGE_STATUS_OPENED 1
+#define GARAGE_STATUS_EXPIRED 2
+#define GARAGE_STATUS_BADSIG 3
+
+void MQTTMessageReceive(char* topic, uint8_t* payload, unsigned int length);
+void PublishDoorState(bool force = false);
+
+enum DoorState { DoorUnknown, DoorClosed, DoorOpening, DoorOpen, DoorClosing, DoorStopped };
+
+#pragma pack(push, 1)
+struct DiagData {
+  uint32_t uptime;
+  uint16_t freeRamKb;
+  uint16_t wifiReconn;
+  uint16_t mqttReconn;
+  uint8_t  sensorErr;
+  uint8_t  resetReason;
+  uint16_t loopMaxMs;
+  uint16_t doorCycles;
+  int8_t   rssi;
+  uint16_t fwVersion;
+  uint16_t otaFailCount;
+  uint16_t lastTravelMs;
+  uint16_t lastLeadMs;
+  uint16_t lastCloseMs;
+};
+#pragma pack(pop)
+static_assert(sizeof(DiagData) == 27, "DiagData wire layout must stay 27 bytes");
+
+WiFiClientSecure net;
+PubSubClient mqtt(net);
+Preferences preferences;
+AM2302::AM2302_Sensor am2302{ TEMPERATURE_SENSOR_PIN };
+
+unsigned long currentMillis = 0;
+unsigned long doorPulseStart = 0;
+unsigned long mqttConnectionTimeout = 0;
+unsigned long mqttLastConnectionTry = 0;
+unsigned long temperatureHumidityReadMillis = 0;
+unsigned long lastDiagSendMillis = 0;
+unsigned long lastStatePublish = 0;
+
+bool doorSignal = false;
+bool doorPulseActive = false;
+bool timeSynced = false;
+char ntpFromDhcp[16] = "";
+
+DoorState doorState = DoorUnknown;
+int8_t lastDirection = 0;
+unsigned long travelMs = 0;
+unsigned long travelBase = 0;
+unsigned long movementOrigin = 0;
+bool movementOriginValid = false;
+bool moving = false;
+bool awaitingReed = false;
+bool travelFromClosed = false;
+bool travelFromOpen = false;
+unsigned long leadMs = T_LEAD_DEFAULT_MS;
+uint16_t measuredTravelMs = 0;
+uint16_t measuredLeadMs = 0;
+uint16_t measuredCloseMs = 0;
+
+volatile unsigned long lastFlashMillis = 0;
+bool flashActive = false;
+unsigned long burstStartMillis = 0;
+
+int reedStable = HIGH;
+int reedRaw = HIGH;
+int reedSamples = 0;
+unsigned long reedRawChangeAt = 0;
+unsigned long reedLastSampleAt = 0;
+
+char temperatureData[20];
+char lastPayload[STATE_PAYLOAD_LEN] = "";
+uint16_t sensorId = 0;
+
+DiagData currentDiagData = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+uint16_t otaFailures = 0;
+
+uint8_t signingKey[GARAGE_KEY_LEN];
+struct OpenSlot {
+  uint8_t nonce[GARAGE_NONCE_LEN];
+  uint32_t issuedAt;
+  uint32_t correlationId;
+  bool valid;
+};
+OpenSlot openSlot = { { 0 }, 0, 0, false };
+bool challengePending = false;
+bool responsePending = false;
+uint8_t reqBuf[4];
+uint8_t respBuf[4 + GARAGE_SIG_LEN];
+
+static uint32_t readLE32(const uint8_t* p) {
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static void writeLE32(uint8_t* p, uint32_t v) {
+  p[0] = (uint8_t)v;
+  p[1] = (uint8_t)(v >> 8);
+  p[2] = (uint8_t)(v >> 16);
+  p[3] = (uint8_t)(v >> 24);
+}
+
+static uint8_t hexNibble(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return 0;
+}
+
+static bool isHexChar(char c) {
+  return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+static bool parseSigningKey() {
+  const char* h = SigningKeyHex;
+  size_t len = strnlen(h, GARAGE_KEY_LEN * 2 + 2);
+  if (len != (size_t)(GARAGE_KEY_LEN * 2)) {
+    Serial.printf("SigningKey: delka %u znaku, ocekavano %u\n", (unsigned)len, (unsigned)(GARAGE_KEY_LEN * 2));
+    return false;
+  }
+  for (uint8_t i = 0; i < GARAGE_KEY_LEN * 2; i++) {
+    if (!isHexChar(h[i])) {
+      Serial.printf("SigningKey: nehexadecimalni znak na pozici %u\n", (unsigned)i);
+      return false;
+    }
+  }
+  for (uint8_t i = 0; i < GARAGE_KEY_LEN; i++) {
+    signingKey[i] = (hexNibble(h[i * 2]) << 4) | hexNibble(h[i * 2 + 1]);
+  }
+  return true;
+}
+
+static bool cryptoSelfTest() {
+  uint8_t mac[32];
+  hmac_sha256(reinterpret_cast<const uint8_t*>("Jefe"), 4,
+              reinterpret_cast<const uint8_t*>("what do ya want for nothing?"), 28, mac);
+  const uint8_t expected[8] = { 0x5b, 0xdc, 0xc1, 0x46, 0xbf, 0x60, 0x75, 0x4e };
+  for (uint8_t i = 0; i < 8; i++) {
+    if (mac[i] != expected[i]) return false;
+  }
+  return true;
+}
+
+void IRAM_ATTR OnDoorFlash() {
+  lastFlashMillis = millis();
+}
+
+static unsigned long closingToOpeningUnits(unsigned long elapsed)
+{
+  return (unsigned long)((uint64_t)elapsed * T_FULL_MS / T_FULL_CLOSE_MS);
+}
+
+static unsigned long currentTravel()
+{
+  if(!moving || !movementOriginValid)
+  {
+    return travelMs;
+  }
+  long delta = (long)(lastFlashMillis - movementOrigin);
+  if(delta <= 0)
+  {
+    return travelBase;
+  }
+  unsigned long elapsed = (unsigned long)delta;
+  if(lastDirection > 0)
+  {
+    unsigned long t = travelBase + elapsed;
+    return t > T_FULL_MS ? T_FULL_MS : t;
+  }
+  if(lastDirection < 0)
+  {
+    unsigned long covered = closingToOpeningUnits(elapsed);
+    return covered >= travelBase ? 0 : travelBase - covered;
+  }
+  return travelBase;
+}
+
+static int positionPercent()
+{
+  if(doorState == DoorUnknown)
+  {
+    return -1;
+  }
+  return (int)((currentTravel() * 100UL) / T_FULL_MS);
+}
+
+static const char* motionText()
+{
+  if(!moving)
+  {
+    return "Stop";
+  }
+  if(lastDirection > 0)
+  {
+    return "Opening";
+  }
+  if(lastDirection < 0)
+  {
+    return "Closing";
+  }
+  return "Move";
+}
+
+void PublishDoorState(bool force)
+{
+  char payload[STATE_PAYLOAD_LEN];
+  snprintf(payload, sizeof payload, "%s;%s;%d", reedStable == HIGH ? "Closed" : "Open", motionText(), positionPercent());
+  lastStatePublish = currentMillis;
+  if(!force && strcmp(payload, lastPayload) == 0)
+  {
+    return;
+  }
+  strlcpy(lastPayload, payload, sizeof lastPayload);
+  bool ok = mqtt.publish(GARAGE_STATE, payload, true);
+  Serial.printf("MQTT: publish %s -> \"%s\" %s (stav spojeni %d)\n",
+                GARAGE_STATE, payload, ok ? "OK" : "SELHALO", mqtt.state());
+}
+
+void OnMovementStart(unsigned long firstFlashAt)
+{
+  burstStartMillis = firstFlashAt;
+  travelBase = travelMs;
+  Serial.printf("POHYB: start (stav=%d, travelMs=%lu)\n", (int)doorState, travelMs);
+  travelFromClosed = false;
+  travelFromOpen = false;
+  awaitingReed = false;
+  movementOriginValid = false;
+  moving = true;
+
+  if(doorState == DoorClosed)
+  {
+    lastDirection = 1;
+    doorState = DoorOpening;
+    travelBase = 0;
+    awaitingReed = true;
+  }
+  else if(doorState == DoorOpen)
+  {
+    lastDirection = -1;
+    doorState = DoorClosing;
+    movementOrigin = firstFlashAt + leadMs;
+    movementOriginValid = true;
+    travelFromOpen = true;
+  }
+  else if(doorState == DoorStopped && lastDirection != 0)
+  {
+    lastDirection = lastDirection > 0 ? -1 : 1;
+    doorState = lastDirection > 0 ? DoorOpening : DoorClosing;
+    movementOrigin = firstFlashAt + leadMs;
+    movementOriginValid = true;
+  }
+  else
+  {
+    lastDirection = 0;
+    doorState = DoorUnknown;
+  }
+  PublishDoorState();
+}
+
+void OnMovementEnd(unsigned long lastFlashAt)
+{
+  moving = false;
+  unsigned long openingElapsed = 0;
+  bool openingFromClosed = false;
+  if(movementOriginValid)
+  {
+    long delta = (long)(lastFlashAt - movementOrigin);
+    unsigned long elapsed = delta > 0 ? (unsigned long)delta : 0;
+    if(lastDirection > 0)
+    {
+      travelMs = travelBase + elapsed;
+      if(travelMs > T_FULL_MS)
+      {
+        travelMs = T_FULL_MS;
+      }
+      openingElapsed = elapsed;
+      openingFromClosed = travelFromClosed;
+    }
+    else if(lastDirection < 0)
+    {
+      unsigned long covered = closingToOpeningUnits(elapsed);
+      if(covered > travelBase + REVERSE_MARGIN_MS)
+      {
+        travelMs = T_FULL_MS;
+        lastDirection = 1;
+        currentDiagData.sensorErr |= 0x02;
+      }
+      else
+      {
+        travelMs = covered >= travelBase ? 0 : travelBase - covered;
+      }
+    }
+  }
+  movementOriginValid = false;
+  awaitingReed = false;
+  travelFromClosed = false;
+  travelFromOpen = false;
+
+  if(reedStable == HIGH)
+  {
+    travelMs = 0;
+    doorState = DoorClosed;
+  }
+  else if(lastDirection == 0)
+  {
+    doorState = DoorUnknown;
+  }
+  else if(travelMs + T_FULL_MARGIN_MS >= T_FULL_MS)
+  {
+    travelMs = T_FULL_MS;
+    doorState = DoorOpen;
+  }
+  else
+  {
+    doorState = DoorStopped;
+  }
+
+  if(doorState == DoorOpen && openingFromClosed && openingElapsed > 0)
+  {
+    measuredTravelMs = openingElapsed > 65535UL ? 65535 : (uint16_t)openingElapsed;
+    Serial.printf("KALIBRACE: otevirani %lu ms\n", openingElapsed);
+  }
+  Serial.printf("POHYB: konec (stav=%d, travelMs=%lu, poloha=%d%%, lastTravel=%u, lastLead=%u, lastClose=%u)\n",
+                (int)doorState, travelMs, positionPercent(), measuredTravelMs, measuredLeadMs, measuredCloseMs);
+  PublishDoorState();
+}
+
+void OnReedChanged(unsigned long edgeAt)
+{
+  Serial.printf("REED: %s (t=%lu, stav=%d, awaitingReed=%d)\n",
+                reedStable == HIGH ? "zavreno" : "otevreno", edgeAt, (int)doorState, (int)awaitingReed);
+  if(reedStable == HIGH)
+  {
+    if(travelFromOpen && movementOriginValid && lastDirection < 0)
+    {
+      long down = (long)(edgeAt - movementOrigin);
+      if(down > 0)
+      {
+        measuredCloseMs = down > 65535L ? 65535 : (uint16_t)down;
+        Serial.printf("KALIBRACE: zavirani %ld ms\n", down);
+      }
+    }
+    travelMs = 0;
+    travelBase = 0;
+    movementOriginValid = false;
+    awaitingReed = false;
+    travelFromClosed = false;
+    travelFromOpen = false;
+    doorState = DoorClosed;
+  }
+  else
+  {
+    if(currentDiagData.doorCycles < 0xFFFF)
+    {
+      currentDiagData.doorCycles++;
+    }
+    if(!awaitingReed)
+    {
+      travelMs = 0;
+      travelBase = 0;
+      movementOriginValid = false;
+      lastDirection = 0;
+      doorState = DoorUnknown;
+      Serial.printf("REED: opustil zavreno bez rozjezdu -> DoorUnknown\n");
+    }
+    if(awaitingReed)
+    {
+      awaitingReed = false;
+      movementOrigin = edgeAt;
+      movementOriginValid = true;
+      travelBase = 0;
+      travelFromClosed = true;
+      long lead = (long)(edgeAt - burstStartMillis);
+      if(lead > 0)
+      {
+        leadMs = (unsigned long)lead;
+        measuredLeadMs = lead > 65535L ? 65535 : (uint16_t)lead;
+      }
+    }
+  }
+  PublishDoorState();
+}
+
+static void publishChallenge(uint32_t r) {
+  uint8_t buf[4 + GARAGE_NONCE_LEN];
+  writeLE32(buf, r);
+  memcpy(buf + 4, openSlot.nonce, GARAGE_NONCE_LEN);
+  mqtt.publish(GARAGE_OPEN_CHALLENGE, buf, sizeof(buf), false);
+}
+
+static void publishResult(uint32_t r, uint8_t status) {
+  uint8_t buf[5];
+  writeLE32(buf, r);
+  buf[4] = status;
+  mqtt.publish(GARAGE_OPEN_RESULT, buf, sizeof(buf), false);
+}
+
+static void processHandshake() {
+  if (challengePending) {
+    challengePending = false;
+    uint32_t r = readLE32(reqBuf);
+    esp_fill_random(openSlot.nonce, GARAGE_NONCE_LEN);
+    openSlot.issuedAt = currentMillis;
+    openSlot.correlationId = r;
+    openSlot.valid = true;
+    publishChallenge(r);
+    Serial.printf("HANDSHAKE: request R=%lu, challenge odeslana\n", (unsigned long)r);
+  }
+  if (responsePending) {
+    responsePending = false;
+    uint32_t r = readLE32(respBuf);
+    uint8_t status = GARAGE_STATUS_EXPIRED;
+    if (openSlot.valid
+        && (currentMillis - openSlot.issuedAt) <= GARAGE_OPEN_TTL
+        && r == openSlot.correlationId) {
+      uint8_t msg[4 + GARAGE_NONCE_LEN + 4];
+      writeLE32(msg, r);
+      memcpy(msg + 4, openSlot.nonce, GARAGE_NONCE_LEN);
+      memcpy(msg + 4 + GARAGE_NONCE_LEN, "open", 4);
+      uint8_t mac[32];
+      hmac_sha256(signingKey, GARAGE_KEY_LEN, msg, sizeof(msg), mac);
+      uint8_t diff = 0;
+      for (uint8_t i = 0; i < GARAGE_SIG_LEN; i++) {
+        diff |= mac[i] ^ respBuf[4 + i];
+      }
+      if (diff == 0) {
+        doorSignal = true;
+        openSlot.valid = false;
+        status = GARAGE_STATUS_OPENED;
+      } else {
+        status = GARAGE_STATUS_BADSIG;
+      }
+    }
+    publishResult(r, status);
+    Serial.printf("HANDSHAKE: response R=%lu, status=%u\n", (unsigned long)r, (unsigned)status);
+  }
+}
+
+void MQTTMessageReceive(char* topic, uint8_t* payload, unsigned int length)
+{
+  if(strcmp(topic, GARAGE_OPEN_REQUEST) == 0)
+  {
+    if(length >= 4)
+    {
+      memcpy(reqBuf, payload, 4);
+      challengePending = true;
+    }
+    else
+    {
+      Serial.printf("HANDSHAKE: request ma %u B, cekano aspon 4\n", length);
+    }
+  }
+  else if(strcmp(topic, GARAGE_OPEN_RESPONSE) == 0)
+  {
+    if(length == sizeof(respBuf))
+    {
+      memcpy(respBuf, payload, sizeof(respBuf));
+      responsePending = true;
+    }
+    else
+    {
+      Serial.printf("HANDSHAKE: response ma %u B, cekano %u (GARAGE_SIG_LEN=%d)\n",
+                    length, (unsigned)sizeof(respBuf), GARAGE_SIG_LEN);
+    }
+  }
+}
+
+bool SyncTime()
+{
+  const ip_addr_t* dhcpServer = esp_sntp_getserver(0);
+  if(dhcpServer != NULL && !ip_addr_isany_val(*dhcpServer))
+  {
+    snprintf(ntpFromDhcp, sizeof(ntpFromDhcp), "%s", ipaddr_ntoa(dhcpServer));
+  }
+  if(ntpFromDhcp[0] != '\0')
+  {
+    Serial.printf("NTP z DHCP: %s\n", ntpFromDhcp);
+    configTime(0, 0, ntpFromDhcp, NTP_SERVER_1, NTP_SERVER_2);
+  }
+  else
+  {
+    configTime(0, 0, NTP_SERVER_1, NTP_SERVER_2);
+  }
+  unsigned long start = millis();
+  time_t now = time(nullptr);
+  while(now < TIME_VALID_THRESHOLD && millis() - start < TIME_SYNC_TIMEOUT_MS)
+  {
+    esp_task_wdt_reset();
+    delay(200);
+    now = time(nullptr);
+  }
+  return now >= TIME_VALID_THRESHOLD;
+}
+
+bool Connect()
+{
+  if(mqtt.connected())
+  {
+    return true;
+  }
+  if(currentMillis - mqttLastConnectionTry < mqttConnectionTimeout)
+  {
+    return false;
+  }
+  mqttLastConnectionTry = currentMillis;
+  if(WiFi.status() != WL_CONNECTED)
+  {
+    if(currentDiagData.wifiReconn < 0xFFFF)
+    {
+      currentDiagData.wifiReconn++;
+    }
+    WiFi.begin(WifiSSID, WifiPassword);
+    unsigned long start = millis();
+    while(WiFi.status() != WL_CONNECTED && millis() - start < WIFI_CONNECT_TIMEOUT_MS)
+    {
+      esp_task_wdt_reset();
+      delay(100);
+    }
+  }
+  if(WiFi.status() != WL_CONNECTED)
+  {
+    mqttConnectionTimeout = min(mqttConnectionTimeout * 2 + random(0, 5000), MQTT_BACKOFF_MAX_MS);
+    Serial.printf("MQTT: WiFi nepripojeno (status %d), backoff %lu ms\n", (int)WiFi.status(), mqttConnectionTimeout);
+    return false;
+  }
+  if(!timeSynced)
+  {
+    timeSynced = SyncTime();
+    if(!timeSynced)
+    {
+      mqttConnectionTimeout = min(mqttConnectionTimeout * 2 + random(0, 5000), MQTT_BACKOFF_MAX_MS);
+      Serial.printf("MQTT: NTP sync selhal, backoff %lu ms\n", mqttConnectionTimeout);
+      return false;
+    }
+  }
+  if(currentDiagData.mqttReconn < 0xFFFF)
+  {
+    currentDiagData.mqttReconn++;
+  }
+  if(!mqtt.connect(MQTT_CLIENT_ID, MQTTUsername, MQTTPassword))
+  {
+    mqttConnectionTimeout = min(mqttConnectionTimeout * 2 + random(0, 5000), MQTT_BACKOFF_MAX_MS);
+    Serial.printf("MQTT: connect na %s:%d SELHAL (stav %d), backoff %lu ms\n",
+                  MQTTHost, MQTT_TLS_PORT, mqtt.state(), mqttConnectionTimeout);
+    return false;
+  }
+  Serial.printf("MQTT: pripojeno jako %s, topic stavu %s\n", MQTT_CLIENT_ID, GARAGE_STATE);
+  mqtt.subscribe(GARAGE_OPEN_REQUEST, 1);
+  mqtt.subscribe(GARAGE_OPEN_RESPONSE, 1);
+  PublishDoorState(true);
+  mqttConnectionTimeout = 0;
+  return true;
+}
+
+void sendDiag()
+{
+  currentDiagData.uptime = (uint32_t)(esp_timer_get_time() / 60000000LL);
+  currentDiagData.freeRamKb = (uint16_t)(ESP.getFreeHeap() / 1024);
+  currentDiagData.rssi = (int8_t)WiFi.RSSI();
+  currentDiagData.fwVersion = (uint16_t)FW_VERSION;
+  currentDiagData.otaFailCount = otaFailures;
+  currentDiagData.lastTravelMs = measuredTravelMs;
+  currentDiagData.lastLeadMs = measuredLeadMs;
+  currentDiagData.lastCloseMs = measuredCloseMs;
+  mqtt.publish(GARAGE_DIAG, reinterpret_cast<const uint8_t*>(&currentDiagData), sizeof(DiagData), false);
+  currentDiagData.loopMaxMs = 0;
+  currentDiagData.sensorErr = 0;
+}
+
+bool OtaAllowed()
+{
+  return doorState == DoorClosed
+    && !moving
+    && !doorPulseActive
+    && !doorSignal
+    && !openSlot.valid
+    && !challengePending
+    && !responsePending;
+}
+
+void setup() {
+  currentDiagData.resetReason = (uint8_t)esp_reset_reason();
+
+  gpio_set_level((gpio_num_t)DOORBUTTON_PIN, DOORBUTTON_IDLE);
+  pinMode(DOORBUTTON_PIN, OUTPUT);
+  digitalWrite(DOORBUTTON_PIN, DOORBUTTON_IDLE);
+
+  pinMode(DOORSWITCH_PIN, INPUT_PULLUP);
+  pinMode(DOORFLASH_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(DOORFLASH_PIN), OnDoorFlash, FALLING);
+
+  Serial.begin(115200);
+
+  preferences.begin("garage", false);
+  sensorId = preferences.getUShort("sensorId", 0);
+  if (sensorId == 0xFFFF || sensorId == 0)
+  {
+    sensorId = DEFAULT_SENSOR_ID;
+    preferences.putUShort("sensorId", sensorId);
+  }
+
+  WiFi.mode(WIFI_STA);
+  esp_sntp_servermode_dhcp(true);
+  WiFi.begin(WifiSSID, WifiPassword);
+  net.setCACert(MQTTCACert);
+  mqtt.setServer(MQTTHost, MQTT_TLS_PORT);
+  mqtt.setCallback(MQTTMessageReceive);
+  mqtt.setBufferSize(256);
+  mqtt.setKeepAlive(MQTT_KEEPALIVE_S);
+
+  if (am2302.begin())
+  {
+    delay(3000);
+  }
+
+  reedRaw = digitalRead(DOORSWITCH_PIN);
+  reedStable = reedRaw;
+  doorState = reedStable == HIGH ? DoorClosed : DoorUnknown;
+  randomSeed(esp_random());
+
+  if (!parseSigningKey()) {
+    Serial.println("SigningKey INVALID");
+  }
+  Serial.println(cryptoSelfTest() ? "HMAC selftest OK" : "HMAC selftest FAIL");
+  Serial.printf("PROTOKOL: nonce=%d B, klic=%d B, podpis=%d B, TTL=%lu ms\n",
+                GARAGE_NONCE_LEN, GARAGE_KEY_LEN, GARAGE_SIG_LEN, (unsigned long)GARAGE_OPEN_TTL);
+
+  esp_task_wdt_config_t wdtConfig = {
+    .timeout_ms = WDT_TIMEOUT_S * 1000,
+    .idle_core_mask = 0,
+    .trigger_panic = true
+  };
+  esp_task_wdt_reconfigure(&wdtConfig);
+  esp_task_wdt_add(NULL);
+  Serial.println("Setup OK");
+}
+
+void loop() {
+  currentMillis = millis();
+  esp_task_wdt_reset();
+
+  if(!mqtt.connected())
+  {
+    Connect();
+  }
+  mqtt.loop();
+
+  unsigned long flashNow = millis();
+  int flashRaw = digitalRead(DOORFLASH_PIN);
+  if(flashRaw == LOW)
+  {
+    lastFlashMillis = flashNow;
+  }
+  unsigned long flashAt = lastFlashMillis;
+  long flashAge = (long)(flashNow - flashAt);
+  bool nowFlashing = flashAt != 0 && flashAge >= 0 && (unsigned long)flashAge < FLASH_TIMEOUT_MS;
+
+  unsigned long reedNow = millis();
+  unsigned long reedGap = reedNow - reedLastSampleAt;
+  reedLastSampleAt = reedNow;
+  int raw = digitalRead(DOORSWITCH_PIN);
+  if(reedGap > REED_DEBOUNCE_MS)
+  {
+    if(reedStable != reedRaw)
+    {
+      currentDiagData.sensorErr |= 0x04;
+      Serial.printf("REED: debounce zahozen po %lu ms bez vzorku\n", reedGap);
+    }
+    reedRaw = raw;
+    reedRawChangeAt = reedNow;
+    reedSamples = 1;
+  }
+  else if(raw != reedRaw)
+  {
+    reedRaw = raw;
+    reedRawChangeAt = reedNow;
+    reedSamples = 1;
+  }
+  else
+  {
+    if(reedSamples < REED_DEBOUNCE_SAMPLES)
+    {
+      reedSamples++;
+    }
+    if(reedStable != reedRaw
+       && reedSamples >= REED_DEBOUNCE_SAMPLES
+       && reedNow - reedRawChangeAt >= REED_DEBOUNCE_MS)
+    {
+      reedStable = reedRaw;
+      OnReedChanged(reedRawChangeAt);
+    }
+  }
+
+  if(nowFlashing && !flashActive)
+  {
+    flashActive = true;
+    OnMovementStart(flashAt);
+  }
+  else if(!nowFlashing && flashActive)
+  {
+    flashActive = false;
+    OnMovementEnd(flashAt);
+  }
+
+  if(moving && currentMillis - lastStatePublish >= MOVE_PUBLISH_INTERVAL)
+  {
+    PublishDoorState();
+  }
+
+  processHandshake();
+
+  if(doorSignal && !doorPulseActive)
+  {
+    digitalWrite(DOORBUTTON_PIN, DOORBUTTON_ACTIVE);
+    doorPulseStart = currentMillis;
+    doorPulseActive = true;
+    doorSignal = false;
+    Serial.printf("PULZ: GPIO%d -> %d (start, %lu ms)\n", DOORBUTTON_PIN, DOORBUTTON_ACTIVE, DOOR_PULSE_MS);
+  }
+  if(doorPulseActive && currentMillis - doorPulseStart >= DOOR_PULSE_MS)
+  {
+    digitalWrite(DOORBUTTON_PIN, DOORBUTTON_IDLE);
+    doorPulseActive = false;
+    Serial.printf("PULZ: GPIO%d -> %d (konec), digitalRead=%d\n", DOORBUTTON_PIN, DOORBUTTON_IDLE, digitalRead(DOORBUTTON_PIN));
+  }
+
+  if(currentMillis - temperatureHumidityReadMillis > TEMPERATURE_INTERVAL)
+  {
+    uint8_t status = am2302.read();
+    if(status != AM2302::AM2302_READ_OK)
+    {
+      currentDiagData.sensorErr |= 0x01;
+    }
+    int temperature = (int)lroundf(am2302.get_Temperature() * 10);
+    int humidity = (int)lroundf(am2302.get_Humidity());
+    sprintf(temperatureData, "%u;%d;%d;%d", sensorId, temperature, humidity, SENSOR_CHANNEL);
+    mqtt.publish(GARAGE_TEMPERATURE, temperatureData);
+    temperatureHumidityReadMillis = currentMillis;
+  }
+
+  if(currentMillis - lastDiagSendMillis > DIAG_INTERVAL)
+  {
+    sendDiag();
+    lastDiagSendMillis = currentMillis;
+  }
+
+  if(OtaAllowed())
+  {
+    otaLoop();
+  }
+
+  unsigned long loopDuration = millis() - currentMillis;
+  if(loopDuration > currentDiagData.loopMaxMs)
+  {
+    currentDiagData.loopMaxMs = (loopDuration > 65535UL) ? 65535 : (uint16_t)loopDuration;
+  }
+}
