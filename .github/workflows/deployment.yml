@@ -24,4 +24,3 @@ jobs:
       serial_port: ${{ inputs.serial_port }}
       device_name: Garage
       source_dir: "./src/Arduino"
-    secrets: inherit
