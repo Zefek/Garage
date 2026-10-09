@@ -508,6 +508,17 @@ void MQTTMessageReceive(char* topic, uint8_t* payload, unsigned int length)
                     length, (unsigned)sizeof(respBuf), GARAGE_SIG_LEN);
     }
   }
+  else if(strcmp(topic, GARAGE_OTA) == 0)
+  {
+    if(length != sizeof(OTA_NOTIFY_PAYLOAD) - 1
+       || memcmp(payload, OTA_NOTIFY_PAYLOAD, length) != 0)
+    {
+      Serial.printf("OTA: neplatna zprava na %s (%u B)\n", topic, length);
+      return;
+    }
+    Serial.println("OTA: prisla notifikace");
+    otaRequest();
+  }
 }
 
 bool SyncTime()
@@ -592,6 +603,8 @@ bool Connect()
   Serial.printf("MQTT: pripojeno jako %s, topic stavu %s\n", MQTT_CLIENT_ID, GARAGE_STATE);
   mqtt.subscribe(GARAGE_OPEN_REQUEST, 1);
   mqtt.subscribe(GARAGE_OPEN_RESPONSE, 1);
+  mqtt.subscribe(GARAGE_OTA, 1);
+  otaRequest();
   PublishDoorState(true);
   mqttConnectionTimeout = 0;
   return true;
